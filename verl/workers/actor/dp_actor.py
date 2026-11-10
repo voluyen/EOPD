@@ -616,7 +616,7 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         # Include ref_log_prob if using KL loss or on-policy distillation
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-        is_on_policy_distill = loss_mode == "on_policy_distill"
+        is_on_policy_distill = loss_mode in ["on_policy_distill", "cw_opd", "cw_eopd", "fuw"]
         if self.config.use_kl_loss or is_on_policy_distill:
             select_keys.append("ref_log_prob")
             # Also include full sequence and top-k logits if available
@@ -626,16 +626,17 @@ class DataParallelPPOActor(BasePPOActor):
                 select_keys.append("ref_topk_log_probs")
             if "ref_topk_indices" in data.batch.keys():
                 select_keys.append("ref_topk_indices")
-            # ref_entropy is REQUIRED for on_policy_distill
+            # ref_entropy is REQUIRED for on_policy_distill and cw_eopd
             if "ref_entropy" in data.batch.keys():
                 select_keys.append("ref_entropy")
-            elif is_on_policy_distill:
+            elif loss_mode in ["on_policy_distill", "cw_eopd"]:
                 raise RuntimeError(
-                    f"ref_entropy not found in data.batch for on_policy_distill. "
+                    f"ref_entropy not found in data.batch for {loss_mode}. "
                     f"Available keys: {sorted(list(data.batch.keys()))}"
                 )
-        # Include pre-computed IS weights if present in batch
-        # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
+        # Include pre-computed IS weights or CW weights if present in batch
+        if "cw_weights" in data.batch.keys():
+            select_keys.append("cw_weights")
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
@@ -755,9 +756,12 @@ class DataParallelPPOActor(BasePPOActor):
                     # For on_policy_distill, ref_log_prob (teacher) is passed separately
                     policy_loss_agg_mode = loss_agg_mode
                     
-                    # Prepare extra args for on_policy_distill with soft KD
+                    # Prepare extra args for on_policy_distill with soft KD or consequence-weighted OPD
                     extra_loss_args = {}
-                    if loss_mode == "on_policy_distill":
+                    if "cw_weights" in model_inputs:
+                        extra_loss_args["cw_weights"] = model_inputs["cw_weights"]
+
+                    if loss_mode in ["on_policy_distill", "cw_eopd"]:
                         response_length = log_prob.shape[1]
                         
                         # Debug context for loss-side logging
@@ -771,7 +775,7 @@ class DataParallelPPOActor(BasePPOActor):
                             print(f"[dp_actor.update_policy] DEBUG: model_inputs keys: {sorted(list(model_inputs.keys()))}")
                             print(f"[dp_actor.update_policy] DEBUG: data.batch keys (before select): {sorted(list(data.batch.keys()) if hasattr(data, 'batch') else [])}")
                             raise RuntimeError(
-                                "Missing `ref_entropy` in model_inputs for on_policy_distill. "
+                                f"Missing `ref_entropy` in model_inputs for {loss_mode}. "
                                 "Teacher entropy is required for entropy-gated Soft KD. "
                                 f"Available keys: {sorted(list(model_inputs.keys()))}"
                             )
@@ -788,7 +792,7 @@ class DataParallelPPOActor(BasePPOActor):
                         ref_topk_log_probs = model_inputs.get("ref_topk_log_probs", None)
                         if ref_topk_log_probs is None:
                             raise RuntimeError(
-                                "Missing `ref_topk_log_probs` in model_inputs for on_policy_distill Soft KD. "
+                                f"Missing `ref_topk_log_probs` in model_inputs for {loss_mode} Soft KD. "
                                 "Ensure `actor_rollout_ref.ref.topk_logits` is set and teacher ref_log_prob path preserves it."
                             )
                         extra_loss_args["teacher_topk_log_probs"] = ref_topk_log_probs[:, -response_length:]
@@ -796,10 +800,13 @@ class DataParallelPPOActor(BasePPOActor):
                         # student_topk_info[0] is (bsz, seqlen, topk) -> need slicing
                         if student_topk_info is None:
                             raise RuntimeError(
-                                "Missing `student_topk_info` for on_policy_distill Soft KD. "
+                                f"Missing `student_topk_info` for {loss_mode} Soft KD. "
                                 "Expected _forward_micro_batch(... teacher_topk_indices=ref_topk_indices) to return student top-k log probs."
                             )
                         extra_loss_args["student_topk_log_probs"] = student_topk_info[0][:, -response_length:]
+                    elif loss_mode == "cw_opd":
+                        if "ref_entropy" in model_inputs:
+                            extra_loss_args["teacher_entropy"] = model_inputs["ref_entropy"]
 
                     pg_loss, pg_metrics = policy_loss_fn(
                         old_log_prob=old_log_prob,

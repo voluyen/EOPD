@@ -2329,3 +2329,8 @@ def compute_policy_loss_bypass_mode(
     pg_metrics.update(rollout_metrics)
 
     return pg_loss, pg_metrics
+
+
+# Register CW-OPD losses
+import verl.trainer.ppo.cw_opd
+

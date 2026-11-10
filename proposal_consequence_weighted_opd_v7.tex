@@ -1,0 +1,682 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[round,authoryear]{natbib}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+\usepackage[capitalise,noabbrev]{cleveref}
+
+% ---------- theorem environments ----------
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{assumption}{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+% ---------- macros ----------
+\newcommand{\PT}{P_{\mathrm{T}}}
+\newcommand{\PS}{P_{\mathrm{S}}}
+\newcommand{\pT}{p_{\mathrm{T}}}
+\newcommand{\pS}{p_{\mathrm{S}}}
+\newcommand{\JT}{J_{\mathrm{T}}}
+\newcommand{\JS}{J_{\mathrm{S}}}
+\newcommand{\aT}{a_{\mathrm{T}}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\TV}{\mathrm{TV}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\cA}{\mathcal{A}}
+\newcommand{\other}{\bot}
+\newcommand{\todo}[1]{\textcolor{red!70!black}{[#1]}}
+
+\title{\textbf{Where Does the Student Lose the Teacher's Conclusion?}\\[4pt]
+\large Teacher Answer-Belief Shifts as a Verifier-Free Allocation Signal for On-Policy Distillation\\[2pt]
+\normalsize Research Proposal --- Version 7}
+\author{\todo{Author names}}
+\date{Draft, November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+On-policy distillation (OPD) trains a student on its own rollouts with token-level feedback from a teacher, and a growing literature reallocates that feedback across positions using local signals or, when outcomes are used, a verifier. We propose a new allocation signal that needs neither a verifier nor gold answers and keeps one rollout per prompt. After each paragraph of a student rollout, the teacher is asked, through a fixed answer probe, for its probability of a few candidate answers fixed before the rollout (its own answer and the student's answers to the same prompt in earlier epochs); the paragraph's weight grows with the total-variation shift of this distribution. The proposal separates three levels. \emph{Proved:} a bound on the teacher--student fidelity gap in terms of shifts of the teacher's continuation answer law; an exact accounting of the error made when the probe replaces that law; and the stationary point of the expected update at a single context with free logits. \emph{Proposed:} using the probed shift to allocate OPD supervision, a heuristic motivated by the bound. \emph{To be tested:} whether the probe reads consequence faithfully, in particular before the answer is written, and whether the reweighting improves training. A pilot without training decides whether the project continues.
+\end{abstract}
+
+\paragraph{Changes from Version 6.}
+\begin{itemize}[itemsep=1pt,topsep=2pt]
+\item \emph{Why total variation.} A new paragraph (\cref{sec:whytv}) justifies $\TV$ as the measure of belief movement and states what it does not capture; the KL variant becomes an ablation (T2(c)).
+\end{itemize}
+
+\section{Motivation}
+\label{sec:motivation}
+
+\paragraph{Allocation in OPD.}
+In OPD the student samples a response and the teacher scores every position \citep{agarwal2024gkd,gu2024minillm,lu2025opd}. Recent work reallocates this feedback by student entropy \citep{tavor2026rethinking}, entropy and divergence \citep{xu2026tip}, the teacher--student confidence gap \citep{kim2026tsdkd}, teacher entropy with an added forward KL \citep{jin2026eopd}, teacher confidence and student confusion \citep{li2026fire}, or a utility derived from the objective \citep{fuw2026}; others look a few steps ahead \citep{jiang2026topd,liu2026sfd,hou2026dash}.
+
+\paragraph{Local signals do not see consequence.}
+\citet{ma2026outcome} finds that local agreement is often agreement on failing trajectories and that local disagreement is not necessarily error; many high-loss tokens are surface-form mismatches \citep{jiang2026topd,he2026cscr}.
+
+\paragraph{Outcome-aware allocation needs labels or extra rollouts.}
+Methods that see outcomes use a verifier or reward \citep{r2opd2026,aopd2026,raopd2026,qu2026spot,jiang2026recoverability}; counterfactual resampling needs many rollouts per step \citep{bogdan2025thought}; answer-likelihood credit needs gold answers \citep{wang2026stepwise,ton2025information,alerd2026,li2026decoupled}.
+
+\paragraph{The question.}
+\emph{Does the shift of the teacher's probed answer beliefs along a single student rollout carry information about consequential steps beyond what local signals and position already carry, before the answer is written and at acceptable cost; and if so, does allocating OPD supervision by it help?}
+
+\section{Positioning and Claims}
+\label{sec:positioning}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{2.6cm}>{\raggedright\arraybackslash}p{4.0cm}>{\raggedright\arraybackslash}p{3.4cm}>{\raggedright\arraybackslash}p{1.6cm}>{\raggedright\arraybackslash}p{1.6cm}@{}}
+\toprule
+Family & Representative work & Signal & Labels or verifier & Extra rollouts \\
+\midrule
+Local & SE-KD, TSD-KD, TIP, EOPD, FiRe-OPD, FUW \citep{tavor2026rethinking,kim2026tsdkd,xu2026tip,jin2026eopd,li2026fire,fuw2026} & entropy, divergence, confidence, objective utility & no & no \\
+Short-horizon & TOPD, LGR, DASH \citep{jiang2026topd,liu2026sfd,hou2026dash} & near-future divergence or teacher confidence & no & no \\
+Outcome-aware & R$^2$-OPD, AOPD, RA-OPD, SPOT, recoverability \citep{r2opd2026,aopd2026,raopd2026,qu2026spot,jiang2026recoverability} & reward or verifier outcome & yes & SPOT, recoverability \\
+Answer-likelihood credit & MIG, DCSD, ALERD \citep{wang2026stepwise,li2026decoupled,alerd2026} & gain of the gold answer & yes (gold) & no \\
+Interpretability & forced answering, thought anchors \citep{lanham2023measuring,bogdan2025thought,qian2025mipeaks} & answer distribution or MI with gold & gold or many samples & many \\
+\midrule
+\textbf{This proposal} & & \textbf{shift of the teacher's probed answer beliefs} & \textbf{no} & \textbf{no} \\
+\bottomrule
+\end{tabular}
+\caption{Families of supervision-allocation and step-importance methods relevant to OPD.}
+\label{tab:positioning}
+\end{table}
+
+\paragraph{Proved, proposed, to be tested.}
+\begin{itemize}[itemsep=2pt]
+\item \emph{Proved.} (i) For success criteria defined on the candidate classes, the fidelity gap is bounded by step mismatch weighted by shifts of the teacher's \emph{continuation} answer law (\cref{thm:main}). (ii) Replacing that law by the probe costs exactly the per-context probe errors at the two ends of each step (\cref{cor:probe}). (iii) At one context with free logits and full support, the expected weighted update vanishes only when student and teacher agree (\cref{prop:stationary}).
+\item \emph{Proposed.} Allocating OPD supervision by the probed shift. This is a heuristic motivated by (i)--(ii), not a consequence of them (\cref{rem:surrogate}).
+\item \emph{To be tested.} Whether the probe reads continuation shifts, with incremental value over local signals and position and before the answer appears (Phase~0); whether the reweighting improves training (\cref{sec:training}).
+\end{itemize}
+
+\paragraph{What we do not claim.}
+Novelty of forced-answer importance as a measure \citep{lanham2023measuring,bogdan2025thought}; that local signals are insufficient, shown by \citet{ma2026outcome}; error localization or correctness as theorems; applicability to open-ended outputs, where the method reverts to OPD.
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Setting}
+For each prompt $x$ the student samples one rollout $y\sim\pS(\cdot\mid x)$, split into paragraphs $s_1,\dots,s_K$; $h_k=(x,s_{1:k-1})$ is the prefix before step $k$ (so $h_1=x$ and $h_{k+1}=(x,s_{1:k})$) and $L_k$ the number of tokens of step $k$. At position $t$ with context $c_t$ and sampled token $y_t$, OPD uses the per-token signal
+\begin{equation}
+a_t=\log\pT(y_t\mid c_t)-\log\pS(y_t\mid c_t)
+\label{eq:adv}
+\end{equation}
+as a stop-gradient advantage \citep{lu2025opd}. $B$ is the set of tokens in the rollout batch, $N=|B|$, and $k(t)$ is the index of the step that contains token $t$.
+
+\subsection{Candidate answers fixed before the rollout}
+\label{sec:candidates}
+The teacher answers each prompt once (greedy) before training; its answer $\aT$ is cached and never checked. For each prompt we keep the set $H_x$ of final answers from its rollouts in earlier epochs. The candidate set is $C_x=\{\aT\}\cup H_x$, fixed before the current rollout; $\lvert C_x\rvert\le3$ with 3 epochs, and $C_x=\{\aT\}$ in the first epoch. Candidates are canonicalized by a symbolic checker and merged into classes; strings with unbalanced braces are dropped. The rollout's own answer is excluded because it depends on tokens after step $k$, which would invalidate \cref{thm:main}. With $C_x=\{\aT\}$ the shift reduces to $g_k=\lvert q_k(\aT)-q_{k-1}(\aT)\rvert$, which is the control for the contribution of the history (T2).
+
+\subsection{Notation: the probed belief $q_k$, the cell $q_k(\other)$, total variation and the shift $g_k$}
+\label{sec:notation}
+
+\paragraph{The partition $\mathcal P_x$.}
+The possible outcomes of the teacher's answer are split into $|C_x|+1$ \emph{cells}:
+\[
+\mathcal P_x=\big\{\{a\}: a\in C_x\big\}\cup\{\other\},
+\]
+one cell per candidate class and one residual cell $\other$ (``anything else''). For example, if $C_x=\{5,7\}$, the cells are ``5'', ``7'' and $\other$.
+
+\paragraph{Probed belief $q_k$.}
+The probe is the fixed string $\pi=$ ``\verb|Therefore, the final answer is \boxed{|''. For $k=0,1,\dots,K$ let $h_{k+1}=(x,s_{1:k})$ be the prompt followed by the first $k$ steps (for $k=0$, the prompt alone). Append $\pi$ to this prefix and ask the \emph{teacher} to score each candidate followed by a closing brace. If the string $a\circ\text{``\}''}$ consists of tokens $\tau_1,\dots,\tau_m$, then
+\begin{equation}
+q_k(a)\;=\;\pT\big(a\circ\text{``\}''}\mid x,s_{1:k},\pi\big)\;=\;\prod_{j=1}^{m}\pT\big(\tau_j\mid x,s_{1:k},\pi,\tau_{<j}\big),\qquad a\in C_x.
+\label{eq:qdef}
+\end{equation}
+So $q_k(a)$ is the probability that the teacher, forced to answer \emph{right now} after reading $k$ steps of the student's reasoning, writes exactly the candidate $a$ and closes the box. It needs one teacher forward pass per candidate and no sampling. The index $k$ always means ``after step $k$''; $q_0$ is the belief before the student has said anything.
+
+\paragraph{The residual cell $q_k(\other)$.}
+Since two different candidates cannot both be the teacher's boxed answer, and the closing brace makes the strings prefix-free (a balanced answer such as ``1'' is not a prefix of ``12'' once the brace is attached), the candidate probabilities are probabilities of disjoint events and satisfy $\sum_{a\in C_x}q_k(a)\le1$. The remaining mass is
+\begin{equation}
+q_k(\other)\;=\;1-\sum_{a\in C_x}q_k(a)\;\ge0 .
+\label{eq:qbot}
+\end{equation}
+It is the probability that, after the probe, the teacher does \emph{not} write any of the candidates followed by ``\}''. It collects: (i) a different answer that is not in $C_x$ (for example a third value); (ii) another surface form or tokenization of a candidate; and (iii) continuations that are not a boxed answer at all (more reasoning, text, an end of sequence). It is \emph{not} renormalized over $C_x$: if the teacher spreads its mass over many unlisted answers, $q_k(\other)$ is large and the candidates keep their small probabilities. Thus $q_k=(q_k(a))_{a\in C_x}\cup\{q_k(\other)\}$ is a probability distribution over the cells of $\mathcal P_x$:
+\begin{equation}
+q_k:\mathcal P_x\to[0,1],\qquad \sum_{a\in C_x}q_k(a)+q_k(\other)=1 .
+\label{eq:answerdist}
+\end{equation}
+
+\paragraph{Total variation $\TV$.}
+For two probability distributions $\mu,\nu$ on the same finite set of cells,
+\begin{equation}
+\TV(\mu,\nu)\;=\;\tfrac12\sum_{i\in\mathcal P_x}\big|\mu(i)-\nu(i)\big|\;=\;\max_{S\subseteq\mathcal P_x}\big|\mu(S)-\nu(S)\big|\;=\;\sum_{i}\big(\mu(i)-\nu(i)\big)_+ ,
+\label{eq:tv}
+\end{equation}
+where $(u)_+=\max(u,0)$. It takes values in $[0,1]$: it is $0$ iff the two distributions coincide and $1$ iff they have disjoint supports. The forms agree because both distributions sum to one. Read as a quantity: $\TV(\mu,\nu)$ is the \emph{fraction of probability mass that has been moved from one cell to another}. The cell $\other$ is included in the sum: a step that makes the teacher abandon every listed candidate (mass moving into $\other$) moves the distribution, and is counted.
+
+\paragraph{Shift of step $k$.}
+\begin{equation}
+g_k\;=\;\TV(q_k,q_{k-1})\;=\;\tfrac12\Big(\sum_{a\in C_x}\big|q_k(a)-q_{k-1}(a)\big|+\big|q_k(\other)-q_{k-1}(\other)\big|\Big)\in[0,1].
+\label{eq:shift}
+\end{equation}
+$q_{k-1}$ is the belief \emph{before} step $k$ (probe after $h_k$) and $q_k$ the belief \emph{after} it (probe after $h_{k+1}$), so $g_k$ is the fraction of the teacher's answer belief that step $k$ displaced. A step that changes nothing about what the teacher would answer has $g_k\approx0$ even if it is long or high-entropy. With $C_x=\{\aT\}$ the cells are $\{\aT\}$ and $\other$, whose changes are equal and opposite, and \cref{eq:shift} reduces to $|q_k(\aT)-q_{k-1}(\aT)|$.
+
+\paragraph{Why total variation?}
+\label{sec:whytv}
+Alternatives exist: the log-ratio of $q(\aT)$, the KL divergence $\KL(q_k\Vert q_{k-1})$ (the information-gain variant), the change of the entropy of $q$, or the change of the single probability $q(\aT)$. $\TV$ is chosen for five reasons.
+\begin{enumerate}[itemsep=1pt,topsep=2pt]
+\item \emph{It is the quantity that enters the bound.} By \cref{prop:targetfree}, for the continuation law, $\TV(\alpha_{\mathcal P}(h'),\alpha_{\mathcal P}(h))=\sup_f|\E_{\alpha(h')}f-\E_{\alpha(h)}f|$ over all success criteria $f\in[0,1]$ that are constant on the cells. So $g^{\mathcal P}_k$ is exactly the largest amount by which step $k$ can change the teacher's probability of success, whatever the criterion. \cref{thm:main} is stated with this quantity, and $g_k$ is its probe counterpart (\cref{cor:probe}). With KL the bound would hold only through Pinsker's inequality $\TV\le\sqrt{\KL/2}$, which is loose for small shifts.
+\item \emph{It measures mass, not log-ratio.} $\TV$ is linear in probability: a move of $0.001$ of mass contributes at most $0.001$. A log-ratio or KL measure is dominated by cells of tiny probability: a candidate whose probability goes from $10^{-6}$ to $10^{-3}$ changes its log-probability by about $6.9$ nats, more than a candidate going from $0.60$ to $0.15$ ($\approx1.4$ nats), although almost no mass has moved. Teacher-forced candidate probabilities are often tiny and noisy (tokenization, surface form), so such a measure would reward noise.
+\item \emph{It is bounded and symmetric.} $g_k\in[0,1]$ for any $|C_x|$ and any $q$, even if some $q_k(a)=0$ (KL is infinite then), and $\TV(q_k,q_{k-1})=\TV(q_{k-1},q_k)$. Boundedness keeps the weights $1+g_k/\bar g_B$ stable without clipping.
+\item \emph{It counts every cell, including $\other$.} Mass leaving the listed candidates is a move of the teacher's answer, and $\TV$ counts it. The single probability $q(\aT)$ misses a move between two other candidates, and the entropy of $q$ misses a move from one confident answer to another.
+\item \emph{It has no parameters and an interpretation.} No temperature, threshold or normalization is needed, in line with the aim of few hyperparameters, and $g_k$ reads as the fraction of belief displaced by step $k$.
+\end{enumerate}
+\emph{Limits.} $\TV$ is not claimed to be the best training weight; it matches the bound, which only motivates the update (\cref{rem:surrogate}). Its linearity is also a weakness: a rare but important change (a wrong candidate going from $0.001$ to $0.05$) is nearly invisible. Whether a log-based measure helps is empirical: the KL variant is ablation T2(c), and probe noise at small probabilities is measured in P1(a).
+
+\paragraph{Three look-alike quantities, kept apart.}
+\begin{itemize}[itemsep=1pt]
+\item $q_k$ (and $g_k$): the \emph{probed} belief, computed in training from teacher forward passes. It answers ``what would the teacher write if it had to answer now?''.
+\item $\alpha_{\mathcal P}(h)$ (and $g^{\mathcal P}_k=\TV(\alpha_{\mathcal P}(h_{k+1}),\alpha_{\mathcal P}(h_k))$): the \emph{continuation} law of the teacher's answer on the cells of $\mathcal P_x$, i.e.\ the answer reached if the teacher continues reasoning from $h$ until it finishes (\cref{sec:theory}). It is the quantity the bound of \cref{thm:main} uses, and it is only estimated in Phase~0 by sampling continuations; it is never computed in training.
+\item $e(h)=\TV(q(h),\alpha_{\mathcal P}(h))$: the \emph{probe error}, the distance between the two (\cref{cor:probe}). Here $q(h_{k+1})=q_k$.
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{2.6cm}>{\raggedright\arraybackslash}p{6.2cm}>{\raggedright\arraybackslash}p{5.2cm}@{}}
+\toprule
+Symbol & Definition & In words \\
+\midrule
+$C_x$, $\mathcal P_x$ & $C_x=\{\aT\}\cup H_x$; cells $\{a\}$, $a\in C_x$, and $\other$ & candidate answers fixed before the rollout; the cells they induce plus ``anything else'' \\
+$q_k(a)$ & $\pT(a\circ\text{``\}''}\mid x,s_{1:k},\pi)$, \cref{eq:qdef} & probability that the teacher, forced to answer after $k$ steps, boxes exactly $a$ \\
+$q_k(\other)$ & $1-\sum_{a\in C_x}q_k(a)$, \cref{eq:qbot} & mass the teacher puts on anything that is not a listed candidate in boxed form \\
+$\TV(\mu,\nu)$ & $\tfrac12\sum_i|\mu(i)-\nu(i)|$, \cref{eq:tv} & fraction of probability mass that moved between cells \\
+$g_k$ & $\TV(q_k,q_{k-1})$, \cref{eq:shift} & how much step $k$ moved the teacher's answer belief \\
+$\alpha_{\mathcal P}(h)$ & teacher's continuation answer law on $\mathcal P_x$ & what the teacher would answer if allowed to keep reasoning from $h$ \\
+$g^{\mathcal P}_k$ & $\TV(\alpha_{\mathcal P}(h_{k+1}),\alpha_{\mathcal P}(h_k))$ & the same shift measured on the continuation law (theory, Phase~0) \\
+$e(h)$ & $\TV(q(h),\alpha_{\mathcal P}(h))$ & probe error at prefix $h$ \\
+$w_k$, $\tilde w_t$ & \cref{eq:weight} & weight of step $k$; normalized weight of token $t$ \\
+\bottomrule
+\end{tabular}
+\caption{Summary of notation.}
+\label{tab:notation}
+\end{table}
+
+\paragraph{A worked example.}
+Let $C_x=\{5,7\}$, with $\aT=5$ and $7$ a wrong answer the student gave in an earlier epoch. Suppose the student's rollout has three steps and the probe gives the beliefs of \cref{tab:example}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lcccc@{\hspace{1.2em}}c@{\hspace{1.2em}}c@{}}
+\toprule
+ & $q(5)$ & $q(7)$ & $q(\other)$ & sum & $g_k$ & $w_k$ ($\bar g_B=0.10$) \\
+\midrule
+$q_0$ (prompt only) & 0.60 & 0.10 & 0.30 & 1 & -- & -- \\
+$q_1$ (after step 1) & 0.62 & 0.09 & 0.29 & 1 & $0.5(0.02+0.01+0.01)=0.02$ & $1+0.02/0.10=1.2$ \\
+$q_2$ (after step 2) & 0.15 & 0.55 & 0.30 & 1 & $0.5(0.47+0.46+0.01)=0.47$ & $1+0.47/0.10=5.7$ \\
+$q_3$ (after step 3) & 0.14 & 0.57 & 0.29 & 1 & $0.5(0.01+0.02+0.01)=0.02$ & $1.2$ \\
+\bottomrule
+\end{tabular}
+\caption{Illustration only (numbers invented). Step 2 moves the teacher's belief from the teacher's own answer toward the wrong candidate; its shift is $0.47$ and its weight is about five times the weight of the other steps. $\bar g_B=0.10$ stands for the batch mean of \cref{eq:weight}. After normalization by the batch the weights have mean one.}
+\label{tab:example}
+\end{table}
+
+Step 2 is the step after which the teacher, if forced to answer, would no longer say $\aT$: it is where the student ``loses the teacher's conclusion'', and it receives the largest weight. Steps 1 and 3 barely move the belief and keep weights near the baseline.
+
+\subsection{Weights and update}
+\label{sec:weights}
+Each token of step $k$ receives the stop-gradient weight
+\begin{equation}
+w_k=1+\frac{g_k}{\bar g_B},\qquad \bar g_B=\frac1N\sum_{t\in B}g_{k(t)},\qquad
+\tilde w_t=\frac{N\,w_{k(t)}}{\sum_{t'\in B}w_{k(t')}},
+\label{eq:weight}
+\end{equation}
+with $w\equiv1$ if $\bar g_B=0$. Here $\bar g_B$ is the token-weighted mean shift of the batch, so a step with $g_k=\bar g_B$ has $w_k=2$ and a step with $g_k=0$ has $w_k=1$. The weights $\tilde w_t$ have mean one over the batch, so the update equals OPD when no step moves the probed beliefs; otherwise half of the batch's weight is uniform and half follows the shift. The default applies the importance of a step to each of its token losses, so the extra budget of step $k$ is proportional to $L_k g_k$. The length-normalized variant, in which each token of step $k$ carries $g_k/L_k$ before the same normalization, tests this budget choice and is the main weighting ablation (T2). Neither allocation is derived from \cref{thm:main}: both are design choices motivated by it (\cref{rem:surrogate}). No clipping or noise threshold is added before the pilot; the pilot measures weight concentration (largest single-step share, which is at most about one half by construction) and the noise floor of $g$.
+
+\paragraph{Implemented update.}
+The update is the PPO-style clipped surrogate used by EOPD in verl \citep{jin2026eopd}, with per-token advantage $\tilde w_t a_t$ and 4 mini-batch steps per rollout batch. For the combination with EOPD, $\tilde w_t$ multiplies EOPD's per-token loss, including its forward-KL term. \Cref{prop:stationary} analyses only the expected gradient at $\theta=\theta_{\mathrm{old}}$, before any optimizer update on the rollout batch, where the importance ratio equals one and clipping is inactive. After the first optimizer step the ratios of later mini-batches differ from one, and those updates are not covered.
+
+\subsection{What the weight does on different rollouts}
+\label{sec:cases}
+The weight decides where the student is corrected; the direction is always toward the teacher's distribution, since \cref{eq:adv} lowers the probability of tokens the student prefers more than the teacher. A larger weight on a wrong step therefore means a stronger correction of it, unlike weighting the likelihood of a trace offline \citep{alerd2026}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{3.8cm}>{\raggedright\arraybackslash}p{4.4cm}>{\raggedright\arraybackslash}p{5.6cm}@{}}
+\toprule
+Rollout & Where $g$ is large & Effect of the weight \\
+\midrule
+Agrees with $\aT$ & steps that settle the shared answer & modest: mismatch there is usually small \\
+Leaves $\aT$; teacher right & departure from $\aT$ & stronger correction at the departure (intended case) \\
+No answer & collapse of belief in $\aT$ & stronger correction where the rollout derails \\
+Leaves $\aT$; teacher wrong & the student's correct departure & stronger pull toward the wrong teacher (main risk) \\
+Both wrong & as above & fidelity to a wrong teacher, as in OPD \\
+\bottomrule
+\end{tabular}
+\caption{Effect of the weight by rollout type. Correctness labels are used for analysis only.}
+\label{tab:cases}
+\end{table}
+
+\subsection{Cost}
+\label{sec:cost}
+The added teacher tokens per rollout are $(K{+}1)\big(|\pi|+\sum_{a\in C_x}(|a|+1)\big)$, about $0.9$--$1.2$k for a 4096-token rollout with about 30 paragraphs. Wall-clock cost depends on the implementation and is measured in Phase~0 for the pipeline that would be used in training: either a teacher served by an inference engine with prefix caching (one short request per boundary), or probe branches packed into the teacher pass with a tree attention mask.
+
+\begin{algorithm}[t]
+\caption{Answer-shift-weighted OPD (one rollout batch)}
+\label{alg:cw}
+\begin{algorithmic}[1]
+\Require prompts with cached $\aT$ and history $H_x$; student $\pS$; teacher $\pT$; probe $\pi$
+\For{each prompt $x$}
+  \State $C_x\gets\{\aT\}\cup H_x$ \Comment{fixed before sampling}
+  \State sample one rollout; split into paragraphs; teacher pass: $a_t$ and $q_0,\dots,q_K$ (\cref{eq:qdef,eq:qbot})
+  \State $g_k\gets\TV(q_k,q_{k-1})$ for $k=1,\dots,K$ (\cref{eq:shift}); add the extracted answer to $H_x$ for later epochs
+\EndFor
+\State compute $\tilde w_t$ (Eq.~\eqref{eq:weight}, stop-gradient)
+\State 4 mini-batch steps of the clipped surrogate with advantage $\tilde w_t a_t$
+\end{algorithmic}
+\end{algorithm}
+
+\section{Theoretical Analysis}
+\label{sec:theory}
+
+\subsection{Setup}
+Fix $x$ and $\mathcal P_x$, determined before the rollout. Steps are macro-actions produced by a stopping rule applied identically to both models, with next-step distributions $\PS(s\mid h)$, $\PT(s\mid h)$ and at most $K_{\max}$ steps. Both models put positive probability on every token sequence, so $r(h,s)=\PT(s\mid h)/\PS(s\mid h)=\exp(\sum_{t\in s}a_t)$.
+
+Let $A(y)$ be the final answer extracted from a complete response $y$, canonicalized as in \cref{sec:candidates}, with $A(y)=\other$ if no answer is found. The \emph{teacher answer law} $\alpha(h)$ is the law of $A(y)$ when the teacher continues from the prefix $h$ to the end of the response, and $\alpha_{\mathcal P}(h)$ is its projection on the cells of $\mathcal P_x$: the probability of each candidate class $\{a\}$, and $\alpha_{\mathcal P}(h)(\other)$ the probability of any other answer or of no answer. Contrast this with the probed belief $q(h)$ of \cref{sec:notation}: $q(h)$ asks the teacher to answer \emph{immediately} after $h$ and $\pi$, whereas $\alpha_{\mathcal P}(h)$ lets the teacher keep reasoning from $h$; a teacher that would still solve the problem after $h$ may have $q(h)$ spread over $\other$ while $\alpha_{\mathcal P}(h)$ is concentrated on the correct candidate. The gap between the two is the probe error $e(h)$ below.
+
+A target $f:\cA\to[0,1]$ is $\mathcal P_x$-measurable if constant on each class (e.g.\ $f=\mathbf 1[a=\aT]$). Write $V_f(h)=\E_{\alpha(h)}f$, $Q_f(h,s)=V_f(h\circ s)$, $\JT^f=V_f(x)$, $\JS^f=\E_{y\sim\PS}f(A(y))$, and along a student rollout $r_k=r(h_k,s_k)$ and
+\[
+g^{\mathcal P}_k=\TV\big(\alpha_{\mathcal P}(h_{k+1}),\alpha_{\mathcal P}(h_k)\big),
+\]
+with $\TV$ as in \cref{eq:tv}.
+
+\begin{proposition}[Projected shift is the worst-case consequence]
+\label{prop:targetfree}
+$\sup_f\lvert\E_\mu f-\E_\nu f\rvert=\TV(\mu_{\mathcal P},\nu_{\mathcal P})\le\TV(\mu,\nu)$, the supremum over $\mathcal P_x$-measurable $f$ with values in $[0,1]$.
+\end{proposition}
+\begin{proof}
+Such $f$ is a function on the classes; apply the variational form of total variation on the classes, and data processing for the inequality.
+\end{proof}
+
+\subsection{Fidelity bound}
+
+\begin{lemma}[Performance-difference decomposition]
+\label{lem:decomp}
+$\JS^f-\JT^f=\E_{y\sim\PS}\big[\sum_{k}(Q_f(h_k,s_k)-V_f(h_k))\big]=\E_{y\sim\PS}\big[\sum_k\E_{s\sim\PS(\cdot\mid h_k)}[Q_f(h_k,s)-V_f(h_k)]\big]$.
+\end{lemma}
+\begin{proof}
+Telescoping $V_f$ along the student rollout, with $V_f$ of a complete response equal to $f(A(y))$, and the tower property. This is the performance-difference decomposition \citep{kakade2002approximately} with the teacher as reference policy, the student as acting policy and $f$ as terminal reward.
+\end{proof}
+
+\begin{lemma}[Change of measure]
+\label{lem:com}
+$\E_{s\sim\PS(\cdot\mid h)}[Q_f-V_f]=\E_{s\sim\PS(\cdot\mid h)}[(1-r(h,s))(Q_f-V_f)]$, since $\E_{s\sim\PT(\cdot\mid h)}[Q_f-V_f]=0$.
+\end{lemma}
+
+\begin{theorem}[Fidelity bound]
+\label{thm:main}
+For every $\mathcal P_x$-measurable $f$ simultaneously,
+$\big\lvert\JS^f-\JT^f\big\rvert\le\E_{y\sim\PS}\big[\sum_k\lvert1-r_k\rvert\,g^{\mathcal P}_k\big]$.
+\end{theorem}
+\begin{proof}
+By \cref{lem:decomp,lem:com}, each term is bounded by $\E_{s\sim\PS(\cdot\mid h_k)}[\lvert1-r\rvert\,\lvert Q_f-V_f\rvert]$, and $\lvert Q_f-V_f\rvert\le\TV(\alpha_{\mathcal P}(h_k\circ s),\alpha_{\mathcal P}(h_k))$ by \cref{prop:targetfree}, for every $s$ because $\mathcal P_x$ is fixed before the rollout. The tower property returns the realized step.
+\end{proof}
+
+\subsection{Replacing the continuation law by the probe}
+
+Let $e(h)=\TV\big(q(h),\alpha_{\mathcal P}(h)\big)$ be the probe error at prefix $h$, where $q(h)$ is the probed distribution \cref{eq:answerdist} at $h$, so that $q_k=q(h_{k+1})$ and $g_k=\TV(q(h_{k+1}),q(h_k))$.
+
+\begin{corollary}[Bound with per-context probe error]
+\label{cor:probe}
+For every rollout and step, $\lvert g_k-g^{\mathcal P}_k\rvert\le e(h_k)+e(h_{k+1})$. Hence, for every $\mathcal P_x$-measurable $f$,
+\[
+\big\lvert\JS^f-\JT^f\big\rvert\le\E_{y\sim\PS}\Big[\sum_k\lvert1-r_k\rvert\,\big(g_k+e(h_k)+e(h_{k+1})\big)\Big].
+\]
+If $e\le\varepsilon$ at all boundaries, the bracket is at most $g_k+2\varepsilon$.
+\end{corollary}
+\begin{proof}
+Triangle inequality for total variation on the cells: $g^{\mathcal P}_k=\TV(\alpha_{\mathcal P}(h_{k+1}),\alpha_{\mathcal P}(h_k))\le\TV(\alpha_{\mathcal P}(h_{k+1}),q(h_{k+1}))+\TV(q(h_{k+1}),q(h_k))+\TV(q(h_k),\alpha_{\mathcal P}(h_k))=e(h_{k+1})+g_k+e(h_k)$, and symmetrically for $g_k$; then \cref{thm:main}.
+\end{proof}
+
+No assumption is needed: the probe error enters exactly where it matters. The corollary shows that the probe must be accurate at the boundaries of steps with large mismatch $\lvert1-r_k\rvert$; good median calibration over all boundaries is not sufficient. Two further remarks. First, $e(h)$ includes the mass of other surface forms and tokenizations of a class, which the probe places in $\other$, and the mass of answers the teacher would reach only after further reasoning. Second, the continuation law is a martingale under teacher steps, $\E_{s\sim\PT(\cdot\mid h)}\alpha_{\mathcal P}(h\circ s)=\alpha_{\mathcal P}(h)$; if $e$ is small everywhere, $q$ is nearly a martingale, so a small martingale gap of $q$ is a necessary check of calibration. It neither establishes calibration nor shows that the probe is useful.
+
+\subsection{From the bound to the update}
+
+\begin{lemma}[Step KL is the OPD estimator]
+\label{lem:chain}
+$\KL\big(\PS(\cdot\mid h_k)\Vert\PT(\cdot\mid h_k)\big)=\E_{s\sim\PS(\cdot\mid h_k)}\big[\sum_{t\in s}\KL(\pS(\cdot\mid c_t)\Vert\pT(\cdot\mid c_t))\big]$.
+\end{lemma}
+
+\begin{remark}[The update is a heuristic motivated by the bound]
+\label{rem:surrogate}
+The bound penalizes the sequence-level ratio mismatch $\lvert1-r_k\rvert$ of each step in proportion to its shift. The update instead multiplies the token signals $a_t$ of the step by a weight increasing in the shift. The two are related but not equal. With token ratios $\rho_t=\pT(y_t\mid c_t)/\pS(y_t\mid c_t)$, telescoping gives
+\[
+1-r_k=1-\prod_{t\in s_k}\rho_t=\sum_{t\in s_k}\Big(\prod_{i<t}\rho_i\Big)(1-\rho_t),
+\qquad\text{so}\qquad
+\lvert1-r_k\rvert\le\sum_{t\in s_k}\Big(\prod_{i<t}\rho_i\Big)\lvert1-\rho_t\rvert:
+\]
+the sequence mismatch is a sum of token mismatches weighted by prefix importance ratios, not their plain sum. \Cref{lem:chain} is the chain rule of KL and holds in expectation over the step; since $g_k$ depends on the sampled step, it cannot be moved through that expectation. The one exact statement at the level of expectations is that the expected absolute ratio mismatch and the step KL have the same zero set: $\E_{s\sim\PS}\lvert1-r\rvert=2\TV(\PS,\PT)$ vanishes iff the step KL does. This does not extend to token estimators, weighted updates or the clipped surrogate. On a sampled step the two mismatches can disagree: with two tokens and $a_1=\log2$, $a_2=-\log2$,
+\[
+r_k=\exp(a_1+a_2)=1,\qquad\lvert1-r_k\rvert=0,
+\]
+although both token signals are nonzero. Token-level correction is therefore not a step-level estimator of the bound's mismatch. What is not guaranteed: (a) that an update decreases the bound; (b) convergence of training; (c) any gain in correctness, since the bound concerns fidelity.
+\end{remark}
+
+\subsection{Stationarity of the expected update}
+
+At a context $c$, let $\bar w(v)=\E[\tilde w_t\mid c_t=c,y_t=v]>0$, which depends on $v$ through the step and shift that follow. With $z$ the student's logits at $c$, treated as free parameters, the expected on-policy update is $u(c)=\E_{v\sim\pS(\cdot\mid c)}[\bar w(v)a(v)\nabla_z\log\pS(v\mid c)]$ with $a(v)=\log\pT(v\mid c)-\log\pS(v\mid c)$.
+
+\begin{proposition}[Contextwise stationarity under independent logits]
+\label{prop:stationary}
+If the logits at $c$ are free parameters and both distributions have full support, then for any positive $\bar w$, $u(c)=0$ iff $\pS(\cdot\mid c)=\pT(\cdot\mid c)$.
+\end{proposition}
+\begin{proof}
+With $p=\pS(\cdot\mid c)$, $\nabla_z\log p(v)=e_v-p$, so $u_j=p_j(\bar w(j)a(j)-\sum_vp_v\bar w(v)a(v))$. Hence $u=0$ iff $\bar w(j)a(j)=\kappa$ for all $j$, i.e.\ $\pT(j)=p_j e^{\kappa/\bar w(j)}$; summing, $\phi(\kappa)=\sum_jp_je^{\kappa/\bar w(j)}=1$, and $\phi$ is strictly increasing with $\phi(0)=1$, so $\kappa=0$.
+\end{proof}
+
+The result does not cover: parameters shared across contexts in a neural student, where updates at different contexts interact; a student that cannot represent the teacher, where $\pS=\pT$ is unattainable and the weighted update may settle elsewhere than the unweighted one; and PPO clipping, stale rollouts across mini-batch steps, and optimizer dynamics. It shows only that the weighting does not create new stationary points in the idealized contextwise case.
+
+\subsection{Supporting statements}
+
+\begin{proposition}[Where a shift can arise]
+\label{prop:where}
+For a token context $c$ and token $v$, $\TV(\alpha_{\mathcal P}(c\circ v),\alpha_{\mathcal P}(c))\le1-\pT(v\mid c)$, and $\E_{v\sim\pT(\cdot\mid c)}\KL(\alpha_{\mathcal P}(c\circ v)\Vert\alpha_{\mathcal P}(c))\le H(\pT(\cdot\mid c))$.
+\end{proposition}
+\begin{proof}
+$\alpha_{\mathcal P}(c)$ is the $\pT(\cdot\mid c)$-mixture of $\alpha_{\mathcal P}(c\circ v)$; the first bound follows from the mixture weight, the second from mutual information being at most the entropy of the next token.
+\end{proof}
+
+This is qualitative: a shift can originate only at tokens the teacher finds unlikely, so teacher surprisal and teacher entropy (the signal of EOPD) are necessary but not sufficient for consequence. Summed over a paragraph it is not a useful bound on the paragraph's shift.
+
+\begin{proposition}[Non-identifiability]
+\label{prop:nonid}
+Next-token distributions at $c$ do not determine $\sup_v\TV(\alpha(c\circ v),\alpha(c))$: for any $\pT,\pS$ with some $0<\pT(v^\ast\mid c)<1$, answer maps exist giving $0$ and at least $1/2$.
+\end{proposition}
+
+\section{Phase 0: Pilot Without Training}
+\label{sec:phase0}
+
+Phase~0 decides whether the project continues. It uses rollouts of Qwen3-1.7B-Base on MATH, the teacher Qwen3-8B (non-thinking) and the probing implementation intended for training. Ground truth comes from teacher continuations (temperature 1.0, up to 4096 tokens) at each paragraph boundary of a subset of about 100 rollouts, estimating $\alpha_{\mathcal P}(h)$ and the gold success rate $V(h)$. Sampling is adaptive: $M=8$ continuations everywhere as a screen, increased to $M=32$ at boundaries whose label is ambiguous and at the boundaries around a candidate transition. With a two-sided 90\% Wilson interval and threshold $\tfrac12$, $M=8$ resolves a boundary only with $0$--$1$ or $7$--$8$ successes, and $M=16$ only with $0$--$4$ or $12$--$16$, so many boundaries would otherwise remain undetermined. The screening stage is of the order of $25$k continuations; the total cost is measured and reported. Gold answers are used only here, never in training.
+
+\paragraph{P1 --- Does the probe read continuation shifts, beyond what is already known?}
+(a) Calibration: distribution of $e(h)$ by relative position and, separately, at boundaries of steps with large estimated $g^{\mathcal P}$ or large $\lvert1-r_k\rvert$, as \cref{cor:probe} requires. (b) Incremental predictive value: regress the continuation shift $\hat g^{\mathcal P}_k$ on relative position, $L_k$, step-mean student entropy, teacher entropy, teacher--student divergence and teacher surprisal, with and without $g_k$; report the gain in explained variance and the partial rank correlation of $g_k$, with confidence intervals from a bootstrap clustered by rollout. Since $\hat g^{\mathcal P}$ is itself noisy, its split-half reliability (from two disjoint halves of the continuations) is reported as a reference point for how much of its variance any predictor could explain; it is not treated as a formal ceiling. (c) Martingale gap of $q$ along teacher steps, as a necessary check only.
+
+\paragraph{P2 --- Does it see consequential steps before the answer appears?}
+Restrict to rollouts with $V(h_1)\ge\tfrac12$. After adaptive sampling, a boundary is labelled low if the 90\% Wilson interval of $V$ lies below $\tfrac12$, high if above, and undetermined otherwise. The fraction of undetermined boundaries and of rollouts whose transition cannot be located is reported; such rollouts are counted in a separate category, never silently dropped. Per-boundary intervals do not give a joint guarantee for a statement about all later boundaries, so the claim ``all later boundaries are low'' uses a Bonferroni correction over the later boundaries of the rollout, and results are also reported with uncorrected labels.
+\begin{itemize}[itemsep=1pt]
+\item \emph{Unrecoverable transition.} For rollouts that end low and contain no undetermined label after it, $k^\ast$ is the step whose transition $h_{k^\ast}\to h_{k^\ast+1}$ is the last change from a non-low to a low label: $h_{k^\ast+1}$ and all later boundaries are low. Rollouts that never become unrecoverable are reported separately, through the share of weight they receive, as a false-positive measure.
+\item \emph{Largest drop.} $k^-=\arg\min_k(\hat V(h_{k+1})-\hat V(h_k))$, for all rollouts.
+\item \emph{Signed agreement.} The signed probe change $q_k(\aT)-q_{k-1}(\aT)$ is compared with $\Delta V_k$ only for prompts where $\aT$ is correct; prompts where the teacher is wrong are reported separately.
+\item \emph{Before the answer.} All metrics are repeated on steps before the first appearance of the rollout's final answer string.
+\end{itemize}
+Comparisons: position only, student entropy, teacher entropy, divergence and surprisal; counterfactual resampling importance \citep{bogdan2025thought} on a small subset.
+
+\paragraph{P3 --- Is it worth the cost?}
+Seconds per training step and memory with and without probing, in the pipeline intended for training. Overhead is defined as
+\[
+\text{overhead}=\frac{T_{\text{method}}-T_{\text{baseline}}}{T_{\text{baseline}}},
+\]
+with $T_{\text{baseline}}$ the step time of OPD measured on the same hardware, batch and configuration, after warm-up.
+
+\paragraph{Decision.}
+Continue to training if the probed shift adds predictive value for continuation shifts beyond position and local signals \emph{before the answer appears}, with an interval excluding zero. The overhead has an engineering target of $25\%$ in the sense of P3; exceeding it triggers optimization of the probing implementation, not abandonment, since a slower method can still be worthwhile if it wins at equal GPU-hours, and the final judgement rests on the compute-matched comparison of T1. These are pragmatic pilot criteria, fixed before running, not a validation of calibration. If the condition fails, the readout is changed (short teacher continuations at a subset of boundaries) or the work becomes an analysis paper; more theory or larger training would not address the weakness.
+
+\section{Training Plan}
+\label{sec:training}
+
+\paragraph{Setup.}
+As in EOPD \citep{jin2026eopd}: Qwen3-8B teacher (non-thinking) \citep{yang2025qwen3}, Qwen3-1.7B-Base student, MATH training split \citep{hendrycks2021math}, verl, learning rate $3\times10^{-6}$, batch 128 prompts with mini-batch 32, one rollout per prompt, maximum response length 4096, temperature 1.0, 3 epochs, $4\times$A100 80GB; EOPD with $\tau=0.8$, coefficient 1.0, top-16. Evaluation on MATH500 \citep{lightman2024verify}, AIME24, AIME25, AMC23, Minerva Math \citep{lewkowycz2022minerva} and OlympiadBench \citep{he2024olympiadbench} with the EOPD protocol (Qwen2.5-Math pipeline, temperature 1.0, top-$p$ 0.8, 8192 tokens, 8 samples), Avg@8 and Pass@8; 3 seeds; paired bootstrap over questions and seeds.
+
+\paragraph{T1 --- First table (1.7B).}
+\begin{enumerate}[itemsep=1pt]
+\item OPD \citep{lu2025opd};
+\item EOPD \citep{jin2026eopd};
+\item FUW \citep{fuw2026}, a strong and cheap reweighting baseline;
+\item ours;
+\item ours combined with EOPD;
+\item a permutation control: $g$ permuted among steps within strata of relative position and length, preserving the weight distribution.
+\end{enumerate}
+Two comparisons are reported: at the same number of updates, and at the same GPU-hours, where OPD and EOPD receive additional training steps equal to the measured probing overhead.
+
+\paragraph{T2 --- Ablations (1.7B).}
+(a) $C_x=\{\aT\}$ only, i.e.\ $g_k=\lvert q_k(\aT)-q_{k-1}(\aT)\rvert$, to measure the contribution of the history; (b) length-normalized allocation $g_k/L_k$, with the same floor and batch normalization, to separate step consequence from paragraph length; (c) $g_k$ replaced by the information-gain variant $\KL(q_k\Vert q_{k-1})$, with the same normalization, to test whether a log-based measure helps or only amplifies noise at small probabilities (\cref{sec:whytv}).
+
+\paragraph{T3 --- Probe versus idea (if budget allows).}
+On a reduced run (a subset of prompts, one epoch), weights from continuation-estimated shifts $\hat g^{\mathcal P}$ replace the probe. Comparing OPD, probe weights and continuation weights separates a weak probe from a weak reweighting idea.
+
+\paragraph{Conditional extensions.}
+Only if T1 shows a gain whose interval excludes zero: the 0.6B and 4B students (DAPO-Math-14k for 4B \citep{yu2025dapo}), KD \citep{hinton2015distilling,kim2016seqkd} and GRPO \citep{shao2024deepseekmath} with compute accounting, further allocation baselines \citep{xu2026tip,jiang2026topd,r2opd2026}, out-of-domain evaluation \citep{rein2024gpqa,wang2024mmlupro,dubois2024alpacaeval}, and the case analysis of \cref{tab:cases}.
+
+\section{Risks}
+\label{sec:risks}
+\begin{description}[leftmargin=1.2em,itemsep=3pt]
+\item[The probe reveals rather than decides.] The central risk, tested by P1--P2 before the answer appears.
+\item[No incremental value over local signals.] Tested by P1(b); the work then becomes an analysis.
+\item[Small training gains.] Seeds, paired bootstrap and compute-matched comparisons; T3 separates the probe from the idea.
+\item[Teacher wrong, student right.] Reported separately in P2 and, if training proceeds, in the case analysis.
+\item[Length, concentration and noise.] T2(b), measured concentration and noise floor; mechanisms are added only if the pilot shows a problem.
+\end{description}
+
+\section{Expected Contributions}
+\begin{enumerate}[itemsep=3pt]
+\item A verifier-free allocation signal for OPD with one rollout per prompt: shifts of the teacher's probed beliefs over candidate answers fixed before the rollout.
+\item A theoretical account with stated scope: a fidelity bound for the continuation law, an exact per-context accounting of probe error, and contextwise stationarity of the expected weighted update under independent logits; the update itself is presented as a heuristic motivated by the bound.
+\item A validation plan: a pilot that tests the incremental predictive value of the probed shift for continuation shifts before the answer appears and its cost, with a stated decision rule, followed by compute-matched training comparisons on the 1.7B student.
+\end{enumerate}
+
+\section{Work Plan}
+\begin{enumerate}[itemsep=2pt]
+\item[Step 1.] Phase~0 (P1--P3) and the decision.
+\item[Step 2.] Reproduce OPD and EOPD on the 1.7B student; T1 and T2.
+\item[Step 3.] T3 if budget allows; conditional extensions only after a positive T1.
+\end{enumerate}
+
+\begin{thebibliography}{99}
+\setlength{\itemsep}{2pt}
+\small
+
+\bibitem[Agarwal et~al.(2024)]{agarwal2024gkd}
+Rishabh Agarwal, Nino Vieillard, Yongchao Zhou, Piotr Stanczyk, Sabela Ramos, Matthieu Geist, and Olivier Bachem.
+\newblock On-policy distillation of language models: Learning from self-generated mistakes.
+\newblock In \emph{ICLR}, 2024.
+
+\bibitem[{AOPD}(2026)]{aopd2026}
+\todo{Authors}.
+\newblock When to follow the teacher: Advantage-based on-policy distillation.
+\newblock \emph{arXiv preprint arXiv:2610.31563}, 2026.
+
+\bibitem[Anonymous(2026)]{alerd2026}
+Anonymous.
+\newblock Decisive, not difficult: Allocating learning effort across reasoning steps in long-{CoT} distillation (ALERD).
+\newblock Under review, 2026.
+
+\bibitem[Bogdan et~al.(2025)]{bogdan2025thought}
+Paul~C. Bogdan, Uzay Macar, Neel Nanda, and Arthur Conmy.
+\newblock Thought anchors: Which {LLM} reasoning steps matter?
+\newblock \emph{arXiv preprint arXiv:2506.19143}, 2025.
+
+\bibitem[{FUW}(2026)]{fuw2026}
+\todo{Authors}.
+\newblock Token utility for on-policy distillation via local trust-region optimization.
+\newblock \emph{arXiv preprint arXiv:2610.18883}, 2026.
+
+\bibitem[Gu et~al.(2024)]{gu2024minillm}
+Yuxian Gu, Li Dong, Furu Wei, and Minlie Huang.
+\newblock {MiniLLM}: Knowledge distillation of large language models.
+\newblock In \emph{ICLR}, 2024.
+
+\bibitem[He et~al.(2026)]{he2026cscr}
+Qiangqiang He, Zhongheng Wu, and ZiJian Wang.
+\newblock Not all tokens deserve equal credit: Counterfactual sensitivity credit reallocation for long-{CoT} reasoning.
+\newblock \emph{arXiv preprint arXiv:2607.27888}, 2026.
+
+\bibitem[Hendrycks et~al.(2021)]{hendrycks2021math}
+Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric Tang, Dawn Song, and Jacob Steinhardt.
+\newblock Measuring mathematical problem solving with the {MATH} dataset.
+\newblock In \emph{NeurIPS Datasets and Benchmarks}, 2021.
+
+\bibitem[Hou et~al.(2026)]{hou2026dash}
+ZhiYan Hou, Xinyu Tang, et~al.
+\newblock {DASH}: Divergence-adaptive supervision horizons for on-policy self-distillation of reasoning models.
+\newblock \emph{arXiv preprint arXiv:2608.06243}, 2026.
+
+\bibitem[Jiang and Ferraro(2026)]{jiang2026topd}
+Yuxuan Jiang and Francis Ferraro.
+\newblock Bridging reasoning trajectories in on-policy distillation via near-future guidance.
+\newblock \emph{arXiv preprint arXiv:2606.00305}, 2026.
+
+\bibitem[Jiang et~al.(2026)]{jiang2026recoverability}
+De~Jiang, Zhengyang Zhang, Kehong Yuan, and Shaohua Ma.
+\newblock Not every divergence should be suppressed: Counterfactual recoverability in on-policy distillation.
+\newblock \emph{arXiv preprint arXiv:2608.04408}, 2026.
+
+\bibitem[Kakade and Langford(2002)]{kakade2002approximately}
+Sham Kakade and John Langford.
+\newblock Approximately optimal approximate reinforcement learning.
+\newblock In \emph{ICML}, 2002.
+
+\bibitem[Kim and Baek(2026)]{kim2026tsdkd}
+Minsang Kim and Seung~Jun Baek.
+\newblock Explain in your own words: Improving reasoning via token-selective dual knowledge distillation.
+\newblock In \emph{ICLR}, 2026.
+
+\bibitem[Lanham et~al.(2023)]{lanham2023measuring}
+Tamera Lanham et~al.
+\newblock Measuring faithfulness in chain-of-thought reasoning.
+\newblock \emph{arXiv preprint arXiv:2307.13702}, 2023.
+
+\bibitem[Li et~al.(2026a)]{li2026decoupled}
+Yugu Li, Zehong Cao, Peizhen Li, Yang Zhang, Siyi Hu, and Jianglin Qiao.
+\newblock Can we trust the teacher? {D}ecoupled credit direction-magnitude for self-distillation.
+\newblock \emph{arXiv preprint arXiv:2609.34848}, 2026.
+
+\bibitem[Li et~al.(2026b)]{li2026fire}
+Yuying Li, Leqi Zheng, Yongzi Yu, Wenrui Zhou, Xuchang Zhong, Xing Hu, Jing Jin, Hangjie Yuan, and Tao Feng.
+\newblock Filter, then reweight: Rethinking optimization granularity in on-policy distillation.
+\newblock \emph{arXiv preprint arXiv:2606.02684}, 2026.
+
+\bibitem[Lightman et~al.(2024)]{lightman2024verify}
+Hunter Lightman, Vineet Kosaraju, Yura Burda, Harri Edwards, Bowen Baker, Teddy Lee, Jan Leike, John Schulman, Ilya Sutskever, and Karl Cobbe.
+\newblock Let's verify step by step.
+\newblock In \emph{ICLR}, 2024.
+
+\bibitem[Liu et~al.(2026)]{liu2026sfd}
+Yanjiang Liu, Jie Lou, Xinyan Guan, Yuqiu Ji, Hongyu Lin, Ben He, Xianpei Han, Le~Sun, Xing Yu, and Yaojie Lu.
+\newblock Your teacher can't help you here: Combating supervision fidelity decay in on-policy distillation.
+\newblock \emph{arXiv preprint arXiv:2605.30833}, 2026.
+
+\bibitem[Ma(2026)]{ma2026outcome}
+Guoqing Ma.
+\newblock Outcome-confounded local supervision in on-policy distillation.
+\newblock \emph{arXiv preprint arXiv:2607.23731}, 2026.
+
+\bibitem[Qian et~al.(2025)]{qian2025mipeaks}
+Chen Qian, Dongrui Liu, Haochen Wen, Zhen Bai, Yong Liu, and Jing Shao.
+\newblock Demystifying reasoning dynamics with mutual information: Thinking tokens are information peaks in {LLM} reasoning.
+\newblock In \emph{NeurIPS}, 2025.
+
+\bibitem[Qu et~al.(2026)]{qu2026spot}
+Zikun Qu, Min Zhang, Mingze Kong, Zhiwei Shang, Zhengyu Chen, Yikun Ban, Shuang Qiu, and Zhongxiang Dai.
+\newblock {SPOT}: Sparse probing and outcome calibration for on-policy distillation.
+\newblock \emph{arXiv preprint arXiv:2608.04419}, 2026.
+
+\bibitem[{R$^2$-OPD}(2026)]{r2opd2026}
+\todo{Authors}.
+\newblock Reward-aligned reweighting for on-policy distillation.
+\newblock \emph{arXiv preprint arXiv:2609.35517}, 2026.
+
+\bibitem[{RA-OPD}(2026)]{raopd2026}
+\todo{Authors}.
+\newblock When teacher guidance misleads: Reward-aligned on-policy distillation.
+\newblock \emph{arXiv preprint arXiv:2608.27960}, 2026.
+
+\bibitem[Tavor et~al.(2026)]{tavor2026rethinking}
+Almog Tavor, Itay Ebenspanger, Neil Cnaan, and Mor Geva.
+\newblock Rethinking selective knowledge distillation.
+\newblock \emph{arXiv preprint arXiv:2602.01395}, 2026.
+
+\bibitem[Ton et~al.(2025)]{ton2025information}
+Jean-Francois Ton, Muhammad~Faaiz Taufiq, and Yang Liu.
+\newblock Understanding chain-of-thought in {LLMs} through information theory.
+\newblock In \emph{ICML}, 2025.
+
+\bibitem[Wang et~al.(2026)]{wang2026stepwise}
+Xiangwei Wang, Wei Wang, Ken Chen, Nanduni Nimalsiri, Sachith Seneviratne, and Saman Halgamuge.
+\newblock Stepwise intrinsic rewards for reasoning in large language models.
+\newblock \emph{arXiv preprint arXiv:2602.01034}, 2026.
+
+\bibitem[Xu et~al.(2026)]{xu2026tip}
+Yuanda Xu, Hejian Sang, Zhengze Zhou, Ran He, Zhipeng Wang, and Alborz Geramifard.
+\newblock {TIP}: Token importance in on-policy distillation.
+\newblock \emph{arXiv preprint arXiv:2604.14084}, 2026.
+
+\bibitem[Yang et~al.(2025)]{yang2025qwen3}
+An Yang et~al.
+\newblock Qwen3 technical report.
+\newblock \emph{arXiv preprint arXiv:2505.09388}, 2025.
+
+
+\bibitem[Dubois et~al.(2024)]{dubois2024alpacaeval}
+Yann Dubois, Bal\'azs Galambosi, Percy Liang, and Tatsunori~B. Hashimoto.
+\newblock Length-controlled {AlpacaEval}: A simple way to debias automatic evaluators.
+\newblock \emph{arXiv preprint arXiv:2404.04475}, 2024.
+
+\bibitem[He et~al.(2024)]{he2024olympiadbench}
+Chaoqun He et~al.
+\newblock {OlympiadBench}: A challenging benchmark for promoting {AGI} with olympiad-level bilingual multimodal scientific problems.
+\newblock In \emph{ACL}, 2024.
+
+\bibitem[Hinton et~al.(2015)]{hinton2015distilling}
+Geoffrey Hinton, Oriol Vinyals, and Jeff Dean.
+\newblock Distilling the knowledge in a neural network.
+\newblock \emph{arXiv preprint arXiv:1503.02531}, 2015.
+
+\bibitem[Jin et~al.(2026)]{jin2026eopd}
+Woogyeol Jin, Taywon Min, Yongjin Yang, Dennis Wei, Yi~Zhou, Swanand~Ravindra Kadhe, Nathalie Baracaldo, and Kimin Lee.
+\newblock Entropy-aware on-policy distillation of language models.
+\newblock In \emph{ICML}, 2026. arXiv:2603.07079.
+
+\bibitem[Kim and Rush(2016)]{kim2016seqkd}
+Yoon Kim and Alexander~M. Rush.
+\newblock Sequence-level knowledge distillation.
+\newblock In \emph{EMNLP}, 2016.
+
+\bibitem[Lewkowycz et~al.(2022)]{lewkowycz2022minerva}
+Aitor Lewkowycz et~al.
+\newblock Solving quantitative reasoning problems with language models.
+\newblock In \emph{NeurIPS}, 2022.
+
+\bibitem[Lu and {Thinking Machines Lab}(2025)]{lu2025opd}
+Kevin Lu and {Thinking Machines Lab}.
+\newblock On-policy distillation.
+\newblock Thinking Machines Lab: Connectionism, 2025.
+
+\bibitem[Rein et~al.(2024)]{rein2024gpqa}
+David Rein et~al.
+\newblock {GPQA}: A graduate-level {Google}-proof {Q\&A} benchmark.
+\newblock In \emph{COLM}, 2024.
+
+\bibitem[Shao et~al.(2024)]{shao2024deepseekmath}
+Zhihong Shao et~al.
+\newblock {DeepSeekMath}: Pushing the limits of mathematical reasoning in open language models.
+\newblock \emph{arXiv preprint arXiv:2402.03300}, 2024.
+
+\bibitem[Wang et~al.(2024)]{wang2024mmlupro}
+Yubo Wang et~al.
+\newblock {MMLU-Pro}: A more robust and challenging multi-task language understanding benchmark.
+\newblock In \emph{NeurIPS Datasets and Benchmarks}, 2024.
+
+\bibitem[Yu et~al.(2025)]{yu2025dapo}
+Qiying Yu et~al.
+\newblock {DAPO}: An open-source {LLM} reinforcement learning system at scale.
+\newblock \emph{arXiv preprint arXiv:2503.14476}, 2025.
+
+\end{thebibliography}
+
+\end{document}

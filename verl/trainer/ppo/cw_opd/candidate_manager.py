@@ -1,0 +1,259 @@
+# Copyright 2026 The Consequence-Weighted OPD Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Candidate Manager for Consequence-Weighted On-Policy Distillation (CW-OPD).
+
+Implements Section 3.2 of proposal_consequence_weighted_opd_v7:
+- Offline teacher greedy answer cache (a_T)
+- Per-prompt rollout history tracker (H_x) across training epochs
+- Canonicalization and equivalence clustering via math-verify / symbolic checker
+- Candidate set C_x = {a_T} U H_x fixed strictly before the rollout, with |C_x| <= 3
+"""
+
+import hashlib
+import json
+import os
+import re
+from typing import Dict, List, Optional, Set, Tuple
+
+try:
+    from math_verify import parse as mv_parse
+    from math_verify import verify as mv_verify
+    MATH_VERIFY_AVAILABLE = True
+except ImportError:
+    MATH_VERIFY_AVAILABLE = False
+
+
+def check_balanced_braces(s: str) -> bool:
+    """Return True iff string s has properly balanced braces '{' and '}'."""
+    depth = 0
+    for ch in s:
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
+def extract_boxed_content(text: str) -> Optional[str]:
+    """Extract content inside the last \\boxed{...} from text.
+    
+    Handles nested braces correctly. Drops strings with unbalanced braces.
+    """
+    if not text:
+        return None
+
+    idx = text.rfind("\\boxed{")
+    if idx < 0:
+        # Fallback to general patterns if no boxed exists
+        # e.g., "The answer is X"
+        return None
+
+    i = idx + len("\\boxed{")
+    depth = 1
+    content_chars = []
+    while i < len(text) and depth > 0:
+        ch = text[i]
+        if ch == '{':
+            depth += 1
+            content_chars.append(ch)
+        elif ch == '}':
+            depth -= 1
+            if depth > 0:
+                content_chars.append(ch)
+        else:
+            content_chars.append(ch)
+        i += 1
+
+    if depth != 0:
+        # Unbalanced braces!
+        return None
+
+    content = "".join(content_chars).strip()
+    return content if content else None
+
+
+def canonicalize_answer(answer_str: str) -> str:
+    """Normalize and canonicalize a math answer string.
+    
+    Removes cosmetic whitespace, trailing dots, dollar signs, and checks brace validity.
+    """
+    if not answer_str:
+        return ""
+    
+    s = answer_str.strip()
+    # Remove outer math delimiters if present
+    if s.startswith("$") and s.endswith("$") and len(s) >= 2:
+        s = s[1:-1].strip()
+    
+    # Strip unnecessary LaTeX text commands
+    s = re.sub(r"\\text\{([^}]*)\}", r"\1", s)
+    s = re.sub(r"\\mathrm\{([^}]*)\}", r"\1", s)
+    
+    # Standardize whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    
+    # Remove trailing periods if not part of a decimal
+    if s.endswith(".") and not re.search(r"\d+\.$", s):
+        s = s[:-1].strip()
+        
+    return s
+
+
+def are_answers_equivalent(ans1: str, ans2: str) -> bool:
+    """Check mathematical or symbolic equivalence between two answer strings."""
+    c1 = canonicalize_answer(ans1)
+    c2 = canonicalize_answer(ans2)
+    if c1 == c2:
+        return True
+    
+    if MATH_VERIFY_AVAILABLE:
+        try:
+            p1 = mv_parse(f"\\boxed{{{c1}}}")
+            p2 = mv_parse(f"\\boxed{{{c2}}}")
+            if p1 and p2 and mv_verify(p1, p2):
+                return True
+        except Exception:
+            pass
+            
+    # Direct numerical comparison fallback
+    try:
+        val1 = float(c1)
+        val2 = float(c2)
+        if abs(val1 - val2) < 1e-6:
+            return True
+    except (ValueError, TypeError):
+        pass
+
+    return False
+
+
+def get_prompt_hash(prompt_text: str) -> str:
+    """Create a deterministic hash identifier for a prompt text."""
+    return hashlib.sha256(prompt_text.strip().encode("utf-8")).hexdigest()[:16]
+
+
+class CandidateManager:
+    """Manages candidate answers C_x = {a_T} U H_x for prompts.
+    
+    - Caches teacher answers a_T generated before training.
+    - Maintains rollout history H_x across training epochs.
+    - Constructs candidate set C_x for each prompt, ensuring |C_x| <= 3.
+    - Excludes the current rollout's answer from C_x.
+    """
+
+    def __init__(self, teacher_cache_path: Optional[str] = None, max_candidates: int = 3):
+        self.max_candidates = max_candidates
+        self.teacher_cache: Dict[str, str] = {}
+        # H_x: prompt_id -> list of distinct earlier answers
+        self.history: Dict[str, List[str]] = {}
+        
+        if teacher_cache_path and os.path.exists(teacher_cache_path):
+            self.load_teacher_cache(teacher_cache_path)
+
+    def load_teacher_cache(self, path: str):
+        """Load teacher greedy answer cache from a JSON file."""
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            self.teacher_cache.update(data)
+        print(f"[CandidateManager] Loaded {len(self.teacher_cache)} teacher answers from {path}")
+
+    def save_teacher_cache(self, path: str):
+        """Save teacher greedy answer cache to a JSON file."""
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.teacher_cache, f, indent=2, ensure_ascii=False)
+        print(f"[CandidateManager] Saved {len(self.teacher_cache)} teacher answers to {path}")
+
+    def register_teacher_answer(self, prompt_id: str, answer: str):
+        """Register teacher answer a_T for a prompt."""
+        clean_ans = canonicalize_answer(answer)
+        if clean_ans and check_balanced_braces(clean_ans):
+            self.teacher_cache[prompt_id] = clean_ans
+
+    def get_teacher_answer(self, prompt_id: str) -> Optional[str]:
+        """Retrieve teacher answer a_T for prompt."""
+        return self.teacher_cache.get(prompt_id, None)
+
+    def get_candidate_set(self, prompt_id: str, at_only: bool = False) -> List[str]:
+        """Construct candidate set C_x = {a_T} U H_x fixed before rollout.
+        
+        Args:
+            prompt_id: Identifier of the prompt.
+            at_only: If True, returns C_x = {a_T} only (Ablation T2(a)).
+            
+        Returns:
+            List of unique, canonical candidate answers. Always has a_T first if available.
+            Length is at most self.max_candidates (default 3).
+        """
+        a_T = self.get_teacher_answer(prompt_id)
+        candidates: List[str] = []
+        
+        if a_T:
+            candidates.append(a_T)
+        else:
+            # If teacher answer not cached, use a placeholder or empty
+            pass
+
+        if at_only:
+            return candidates
+
+        # Add distinct earlier answers from H_x
+        earlier_answers = self.history.get(prompt_id, [])
+        for ans in earlier_answers:
+            if len(candidates) >= self.max_candidates:
+                break
+            # Check if this answer is already in candidates (or mathematically equivalent)
+            is_dup = False
+            for existing in candidates:
+                if are_answers_equivalent(ans, existing):
+                    is_dup = True
+                    break
+            if not is_dup and check_balanced_braces(ans):
+                candidates.append(ans)
+
+        return candidates
+
+    def update_history(self, prompt_id: str, student_rollout_response: str) -> Optional[str]:
+        """Extract final answer from completed rollout and add to history H_x for NEXT epochs.
+        
+        Args:
+            prompt_id: Identifier of the prompt.
+            student_rollout_response: Full text of the student's completed response.
+            
+        Returns:
+            The extracted canonical answer if valid, else None.
+        """
+        boxed = extract_boxed_content(student_rollout_response)
+        if not boxed:
+            return None
+
+        clean_ans = canonicalize_answer(boxed)
+        if not clean_ans or not check_balanced_braces(clean_ans):
+            return None
+
+        if prompt_id not in self.history:
+            self.history[prompt_id] = []
+
+        # Avoid duplicates in history
+        for existing in self.history[prompt_id]:
+            if are_answers_equivalent(clean_ans, existing):
+                return clean_ans
+
+        # Append to history
+        self.history[prompt_id].append(clean_ans)
+        return clean_ans

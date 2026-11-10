@@ -346,6 +346,9 @@ class TaskRunner:
         if trainer_class_name == "OnPolicyDistillTrainer":
             from verl.trainer.ppo.on_policy_distill_trainer import OnPolicyDistillTrainer
             trainer_cls = OnPolicyDistillTrainer
+        elif trainer_class_name == "CWOPDTrainer":
+            from verl.trainer.ppo.cw_opd import CWOPDTrainer
+            trainer_cls = CWOPDTrainer
         else:
             trainer_cls = RayPPOTrainer
         
