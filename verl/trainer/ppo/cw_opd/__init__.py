@@ -14,7 +14,6 @@ from verl.trainer.ppo.cw_opd.policy_loss import (
     compute_policy_loss_cw_eopd,
     compute_policy_loss_fuw,
 )
-from verl.trainer.ppo.cw_opd.cw_opd_trainer import CWOPDTrainer
 
 __all__ = [
     "CandidateManager",
@@ -31,3 +30,12 @@ __all__ = [
     "compute_policy_loss_fuw",
     "CWOPDTrainer",
 ]
+
+
+def __getattr__(name):
+    """Lazy import: the trainer pulls in ray / the full PPO stack, which the pure-python parts do not need."""
+    if name == "CWOPDTrainer":
+        from verl.trainer.ppo.cw_opd.cw_opd_trainer import CWOPDTrainer
+
+        return CWOPDTrainer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -14,239 +14,191 @@
 # limitations under the License.
 
 """
-Benchmark Evaluator for Consequence-Weighted OPD.
+Benchmark evaluation (Section 6 of proposal v7): MATH500, AIME24, AIME25, AMC23, Minerva Math, OlympiadBench.
 
-Implements the evaluation protocol described in Section 6 of proposal_consequence_weighted_opd_v7:
-- Evaluates models on MATH500, AIME24, AIME25, AMC23, Minerva Math, OlympiadBench
-- Qwen2.5-Math pipeline: temperature 1.0, top-p 0.8, 8192 tokens, 8 samples
-- Reports Avg@8 and Pass@8 metrics
-- Paired bootstrap over questions and seeds for confidence intervals
+Protocol: temperature 1.0, top-p 0.8, 8192 new tokens, 8 samples per problem -> Avg@8 and Pass@8.
+Prompts go through the model's chat template (as in training). vLLM is used when available
+(HF generate is a very slow fallback). Besides the summary, per-problem / per-sample scores are
+written to ``<output>.per_problem.json`` so that methods can be compared with a paired bootstrap
+(``eval/compare_results.py``).
 """
 
 import argparse
 import json
 import os
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import pandas as pd
-import torch
-from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from verl.trainer.ppo.cw_opd.candidate_manager import are_answers_equivalent, extract_boxed_content
-from verl.utils.reward_score.math_verify import compute_score as verify_math_score
+
+BENCHMARKS = ["math500", "aime24", "aime25", "amc23", "minerva_math", "olympiadbench"]
 
 
-def extract_prompt_str(item: Any) -> str:
-    """Extract prompt text from row."""
-    if isinstance(item, list) and len(item) > 0 and isinstance(item[0], dict):
-        return item[0].get("content", "")
-    elif isinstance(item, str):
-        return item
-    return str(item)
+def row_messages(prompt) -> List[Dict[str, str]]:
+    if isinstance(prompt, str):
+        return [{"role": "user", "content": prompt}]
+    return [dict(m) for m in list(prompt)]
 
 
-def extract_gold_str(row: pd.Series) -> str:
-    """Extract ground truth answer from row."""
-    if "reward_model" in row:
-        rm = row["reward_model"]
-        if isinstance(rm, dict) and "ground_truth" in rm:
-            return str(rm["ground_truth"])
-    if "ground_truth" in row:
-        return str(row["ground_truth"])
-    if "answer" in row:
-        return str(row["answer"])
+def row_gold(row: pd.Series) -> str:
+    rm = row.get("reward_model", None)
+    if isinstance(rm, dict) and "ground_truth" in rm:
+        return str(rm["ground_truth"])
+    for k in ("ground_truth", "answer"):
+        if k in row and row[k] is not None:
+            return str(row[k])
     return ""
 
 
-def evaluate_dataset(
-    model: Any,
-    tokenizer: Any,
-    parquet_path: str,
-    n_samples: int = 8,
-    temperature: float = 1.0,
-    top_p: float = 0.8,
-    max_tokens: int = 8192,
-    device: torch.device = torch.device("cpu"),
-    limit: int = -1,
-) -> Dict[str, Any]:
-    """Evaluate model on a benchmark dataset."""
-    df = pd.read_parquet(parquet_path)
-    if limit > 0:
-        df = df.iloc[:limit]
+def is_correct(response: str, gold: str) -> bool:
+    try:
+        from verl.utils.reward_score.math_verify import compute_score as mv_score
 
-    total_problems = len(df)
-    per_problem_avg8: List[float] = []
-    per_problem_pass8: List[float] = []
-    detailed_results: List[Dict[str, Any]] = []
+        if mv_score(response, gold):
+            return True
+    except Exception:  # math_verify missing or failing on this input
+        pass
+    extracted = extract_boxed_content(response) or ""
+    return bool(extracted) and are_answers_equivalent(extracted, gold)
 
-    print(f"\nEvaluating {parquet_path} ({total_problems} problems, {n_samples} samples per prompt)...")
 
-    for idx, row in tqdm(df.iterrows(), total=total_problems, desc="Evaluating problems"):
-        prompt_text = extract_prompt_str(row["prompt"])
-        gold_answer = extract_gold_str(row)
+def chat_prompts(tokenizer, messages_list) -> List[str]:
+    out = []
+    for msgs in messages_list:
+        try:
+            out.append(tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
+                                                     enable_thinking=False))
+        except TypeError:
+            out.append(tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
+    return out
 
-        inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
 
-        sample_correctness = []
-        sample_responses = []
+class VLLMGenerator:
+    def __init__(self, model_path, tp, gpu_util, max_tokens, seed):
+        from vllm import LLM
 
-        with torch.no_grad():
-            for s_idx in range(n_samples):
-                output_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    do_sample=True,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-                resp_ids = output_ids[0, inputs.input_ids.shape[1]:]
-                resp_text = tokenizer.decode(resp_ids, skip_special_tokens=True)
-                sample_responses.append(resp_text)
+        self.llm = LLM(model=model_path, tensor_parallel_size=tp, gpu_memory_utilization=gpu_util,
+                       trust_remote_code=True, dtype="bfloat16", seed=seed,
+                       max_model_len=max_tokens + 2048)
 
-                # Verification with math_verify
-                is_correct = verify_math_score(resp_text, gold_answer)
-                if not is_correct:
-                    # Fallback boxed comparison
-                    extracted = extract_boxed_content(resp_text) or ""
-                    is_correct = are_answers_equivalent(extracted, gold_answer)
+    def __call__(self, prompts, n, temperature, top_p, max_tokens, seed):
+        from vllm import SamplingParams
 
-                sample_correctness.append(1.0 if is_correct else 0.0)
+        sp = SamplingParams(n=n, temperature=temperature, top_p=top_p, max_tokens=max_tokens, seed=seed)
+        return [[c.text for c in o.outputs] for o in self.llm.generate(prompts, sp)]
 
-        avg_8 = float(np.mean(sample_correctness))
-        pass_8 = 1.0 if any(c > 0 for c in sample_correctness) else 0.0
 
-        per_problem_avg8.append(avg_8)
-        per_problem_pass8.append(pass_8)
+class HFGenerator:
+    def __init__(self, model_path, **_):
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        detailed_results.append({
-            "problem_idx": int(idx),
-            "prompt": prompt_text,
-            "ground_truth": gold_answer,
-            "avg_at_8": avg_8,
-            "pass_at_8": pass_8,
-            "sample_scores": sample_correctness,
-        })
+        self.tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.tok.padding_side = "left"
+        if self.tok.pad_token is None:
+            self.tok.pad_token = self.tok.eos_token
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True).eval()
 
-    # Paired bootstrap for confidence intervals (1000 resamples)
-    n_boot = 1000
-    boot_avg = []
-    boot_pass = []
-    n_q = len(per_problem_avg8)
-    for _ in range(n_boot):
-        indices = np.random.choice(n_q, size=n_q, replace=True)
-        boot_avg.append(float(np.mean([per_problem_avg8[i] for i in indices])))
-        boot_pass.append(float(np.mean([per_problem_pass8[i] for i in indices])))
+    def __call__(self, prompts, n, temperature, top_p, max_tokens, seed):
+        import torch
 
-    mean_avg8 = float(np.mean(per_problem_avg8)) * 100.0
-    mean_pass8 = float(np.mean(per_problem_pass8)) * 100.0
-    avg8_ci = (float(np.percentile(boot_avg, 2.5)) * 100.0, float(np.percentile(boot_avg, 97.5)) * 100.0)
-    pass8_ci = (float(np.percentile(boot_pass, 2.5)) * 100.0, float(np.percentile(boot_pass, 97.5)) * 100.0)
+        torch.manual_seed(seed)
+        results = []
+        for p in prompts:
+            inp = self.tok(p, return_tensors="pt").to(self.model.device)
+            with torch.no_grad():
+                out = self.model.generate(**inp, max_new_tokens=max_tokens, do_sample=True, temperature=temperature,
+                                          top_p=top_p, num_return_sequences=n, pad_token_id=self.tok.pad_token_id)
+            results.append(self.tok.batch_decode(out[:, inp.input_ids.shape[1]:], skip_special_tokens=True))
+        return results
 
-    return {
-        "dataset": os.path.basename(parquet_path),
-        "total_problems": total_problems,
-        "avg_at_8": mean_avg8,
-        "avg_at_8_ci95": avg8_ci,
-        "pass_at_8": mean_pass8,
-        "pass_at_8_ci95": pass8_ci,
-        "details": detailed_results,
-    }
+
+def bootstrap_ci(per_problem: np.ndarray, n_boot: int = 1000, seed: int = 0):
+    rng = np.random.RandomState(seed)
+    n = len(per_problem)
+    means = [per_problem[rng.randint(0, n, n)].mean() for _ in range(n_boot)]
+    return float(np.percentile(means, 2.5)) * 100, float(np.percentile(means, 97.5)) * 100
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate model on math reasoning benchmarks")
-    parser.add_argument("--model_path", required=True, help="Trained student checkpoint path")
-    parser.add_argument("--benchmarks_dir", required=True, help="Directory containing test parquets")
-    parser.add_argument("--output_path", required=True, help="Output JSON path to save evaluation summary")
-    parser.add_argument("--n_samples", type=int, default=8, help="Number of samples per problem (default 8)")
-    parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature (default 1.0)")
-    parser.add_argument("--top_p", type=float, default=0.8, help="Top-p sampling (default 0.8)")
-    parser.add_argument("--max_tokens", type=int, default=8192, help="Max tokens per response (default 8192)")
-    parser.add_argument("--limit", type=int, default=-1, help="Limit number of problems per dataset for fast test")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run on")
-    args = parser.parse_args()
-
+    ap = argparse.ArgumentParser(description="Evaluate a model on the six math benchmarks")
+    ap.add_argument("--model_path", required=True, help="HF-format model dir (merged / hf_model checkpoint)")
+    ap.add_argument("--benchmarks_dir", required=True)
+    ap.add_argument("--output_path", required=True)
+    ap.add_argument("--n_samples", type=int, default=8)
+    ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--top_p", type=float, default=0.8)
+    ap.add_argument("--max_tokens", type=int, default=8192)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--limit", type=int, default=-1)
+    ap.add_argument("--tp", type=int, default=1)
+    ap.add_argument("--gpu_util", type=float, default=0.85)
+    ap.add_argument("--backend", default="auto", choices=["auto", "vllm", "hf"])
+    args = ap.parse_args()
     os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
 
-    print(f"[Eval] Loading model from {args.model_path}...")
+    from transformers import AutoTokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    backend = args.backend
+    if backend == "auto":
+        try:
+            import vllm  # noqa: F401
+            backend = "vllm"
+        except ImportError:
+            backend = "hf"
+    print(f"[Eval] model={args.model_path} backend={backend}")
+    gen = (VLLMGenerator(args.model_path, args.tp, args.gpu_util, args.max_tokens, args.seed)
+           if backend == "vllm" else HFGenerator(args.model_path))
 
-    device = torch.device(args.device)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
-        device_map="auto" if device.type == "cuda" else None,
-        trust_remote_code=True,
-    )
-    model.eval()
-
-    # Supported benchmarks from Section 6
-    benchmark_names = [
-        "math500.parquet",
-        "aime24.parquet",
-        "aime25.parquet",
-        "amc23.parquet",
-        "minerva_math.parquet",
-        "olympiadbench.parquet",
-    ]
-
-    summary_results: Dict[str, Any] = {
-        "model_path": args.model_path,
-        "protocol": "Qwen2.5-Math (temp 1.0, top-p 0.8, 8192 tokens, 8 samples)",
+    summary: Dict[str, Any] = {
+        "model_path": args.model_path, "seed": args.seed, "backend": backend,
+        "protocol": f"temp {args.temperature}, top-p {args.top_p}, {args.max_tokens} tokens, {args.n_samples} samples",
         "benchmarks": {},
     }
+    per_problem_out: Dict[str, Any] = {}
+    missing = [b for b in BENCHMARKS if not os.path.exists(os.path.join(args.benchmarks_dir, f"{b}.parquet"))]
+    if missing:
+        print(f"[Eval WARNING] missing benchmarks (skipped): {missing}")
+        summary["missing_benchmarks"] = missing
 
-    # Find matching parquets in benchmarks_dir
-    found_files = []
-    for root, _, files in os.walk(args.benchmarks_dir):
-        for f in files:
-            if f.endswith(".parquet"):
-                found_files.append(os.path.join(root, f))
-
-    if not found_files:
-        print(f"[Eval Error] No parquet files found in {args.benchmarks_dir}")
-        return
-
-    for p_path in found_files:
-        fname = os.path.basename(p_path)
-        bench_res = evaluate_dataset(
-            model=model,
-            tokenizer=tokenizer,
-            parquet_path=p_path,
-            n_samples=args.n_samples,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            max_tokens=args.max_tokens,
-            device=device,
-            limit=args.limit,
-        )
-        summary_results["benchmarks"][fname] = {
-            "avg_at_8": bench_res["avg_at_8"],
-            "avg_at_8_ci95": bench_res["avg_at_8_ci95"],
-            "pass_at_8": bench_res["pass_at_8"],
-            "pass_at_8_ci95": bench_res["pass_at_8_ci95"],
-            "total_problems": bench_res["total_problems"],
+    for name in BENCHMARKS:
+        path = os.path.join(args.benchmarks_dir, f"{name}.parquet")
+        if not os.path.exists(path):
+            continue
+        df = pd.read_parquet(path)
+        if args.limit > 0:
+            df = df.iloc[: args.limit]
+        msgs = [row_messages(p) for p in df["prompt"]]
+        golds = [row_gold(r) for _, r in df.iterrows()]
+        print(f"[Eval] {name}: {len(df)} problems x {args.n_samples} samples")
+        outs = gen(chat_prompts(tokenizer, msgs), args.n_samples, args.temperature, args.top_p, args.max_tokens,
+                   args.seed)
+        scores = np.array([[float(is_correct(r, g)) for r in rs] for rs, g in zip(outs, golds)])  # (problems, n)
+        avg8, pass8 = scores.mean(axis=1), (scores.max(axis=1) > 0).astype(float)
+        summary["benchmarks"][name] = {
+            "avg_at_8": float(avg8.mean() * 100), "avg_at_8_ci95": bootstrap_ci(avg8),
+            "pass_at_8": float(pass8.mean() * 100), "pass_at_8_ci95": bootstrap_ci(pass8),
+            "total_problems": int(len(df)),
+            "mean_response_chars": float(np.mean([len(r) for rs in outs for r in rs])),
+            "frac_with_boxed": float(np.mean([extract_boxed_content(r) is not None for rs in outs for r in rs])),
         }
+        per_problem_out[name] = {"avg_at_8": avg8.tolist(), "pass_at_8": pass8.tolist(), "sample_scores": scores.tolist()}
+        b = summary["benchmarks"][name]
+        print(f"[Eval] {name:14s} Avg@8 {b['avg_at_8']:5.2f} {tuple(round(x,1) for x in b['avg_at_8_ci95'])}  "
+              f"Pass@8 {b['pass_at_8']:5.2f}  boxed {b['frac_with_boxed']:.2f}")
 
-    # Save summary
-    with open(args.output_path, "w", encoding="utf-8") as f:
-        json.dump(summary_results, f, indent=2)
-
-    print(f"\n=======================================================")
-    print(f"                 EVALUATION SUMMARY                    ")
-    print(f"=======================================================")
-    for b_name, b_data in summary_results["benchmarks"].items():
-        print(f"Benchmark: {b_name:25s} | Avg@8: {b_data['avg_at_8']:5.2f}% (CI: [{b_data['avg_at_8_ci95'][0]:.1f}, {b_data['avg_at_8_ci95'][1]:.1f}]) | Pass@8: {b_data['pass_at_8']:5.2f}%")
-    print(f"=======================================================")
-    print(f"Detailed results saved to {args.output_path}")
+    with open(args.output_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    with open(args.output_path + ".per_problem.json", "w") as f:
+        json.dump(per_problem_out, f)
+    print(f"[Eval] saved {args.output_path} (+ .per_problem.json)")
 
 
 if __name__ == "__main__":

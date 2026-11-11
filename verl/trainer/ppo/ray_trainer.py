@@ -1286,6 +1286,10 @@ class RayPPOTrainer:
             values = self.critic_wg.compute_values(batch)
         return values
 
+    def _consume_extra_metrics(self) -> dict:
+        """Hook: subclasses return (and clear) metrics collected during the step; logged with the step metrics."""
+        return {}
+
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
             # step 1: convert dataproto to tensordict.
@@ -1673,6 +1677,7 @@ class RayPPOTrainer:
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+                        metrics.update(self._consume_extra_metrics())
 
                     # compute values
                     if self.use_critic:

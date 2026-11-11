@@ -112,7 +112,7 @@ def compute_policy_loss_cw_opd(
     }
 
     if w_tilde is not None:
-        metrics["actor/cw_weight_max"] = verl_F.masked_mean(w_tilde, response_mask).detach().item()
+        metrics["actor/cw_weight_mean"] = verl_F.masked_mean(w_tilde, response_mask).detach().item()
 
     return pg_loss, metrics
 

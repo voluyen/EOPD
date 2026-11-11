@@ -53,13 +53,16 @@ from verl.trainer.ppo.cw_opd.candidate_manager import (
     extract_boxed_content,
     get_prompt_hash,
 )
+from verl.trainer.ppo.cw_opd.candidate_manager import (
+    extract_question_from_chat_prompt,
+    question_text_from_messages,
+)
 from verl.trainer.ppo.cw_opd.probe_scorer import (
     PROBE_STRING,
-    ProbeScorer,
     StepBoundary,
     compute_total_variation,
-    split_response_into_steps,
 )
+from verl.trainer.ppo.cw_opd.teacher_probe import probe_batch, segment_token_ids
 
 
 def wilson_score_interval(successes: int, total: int, confidence: float = 0.90) -> Tuple[float, float]:
@@ -126,6 +129,7 @@ class StepEvaluation:
     teacher_surprisal: float
     mismatch_ratio: float      # |1 - r_k|
     before_answer: bool
+    delta_q_aT: float = 0.0    # signed change of the probed belief in a_T, q_k(a_T) - q_{k-1}(a_T)
 
 
 @dataclass
@@ -145,7 +149,13 @@ class RolloutEvaluation:
 
 
 class Phase0Runner:
-    """Executes Phase 0 pilot protocol without model training."""
+    """Executes the Phase 0 pilot (no training) with the same probing code path as training.
+
+    Pipeline per prompt: student rollouts (vLLM, chat template) -> token-exact paragraph segmentation ->
+    probe beliefs q_k with the HF teacher (teacher_probe.probe_batch) -> teacher continuations from every
+    boundary (vLLM, adaptive M) giving alpha_P(h) and V(h) -> local signals (HF student + teacher).
+    Gold answers are used only here; a_T comes from the cached greedy teacher answers.
+    """
 
     def __init__(
         self,
@@ -154,158 +164,196 @@ class Phase0Runner:
         num_prompts: int = 100,
         m_screen: int = 8,
         m_adaptive: int = 32,
+        n_history: int = 2,
+        max_resp_len: int = 4096,
+        cont_max_tokens: int = 4096,
+        gpu_util_student: float = 0.15,
+        gpu_util_teacher: float = 0.35,
+        seed: int = 0,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        mock_mode: bool = False,
     ):
         self.student_model_path = student_model_path
         self.teacher_model_path = teacher_model_path
         self.num_prompts = num_prompts
         self.m_screen = m_screen
         self.m_adaptive = m_adaptive
+        self.n_history = n_history
+        self.max_resp_len = max_resp_len
+        self.cont_max_tokens = cont_max_tokens
+        self.seed = seed
         self.device = torch.device(device)
-        self.mock_mode = mock_mode
-
         self.candidate_manager = CandidateManager()
-        self.probe_scorer = ProbeScorer()
+        self.timing = {"probe_s": 0.0, "probe_tokens": 0.0, "plain_teacher_s": 0.0, "plain_teacher_tokens": 0.0}
+        self._load_models(gpu_util_student, gpu_util_teacher)
 
-        self.student_model = None
-        self.teacher_model = None
-        self.tokenizer = None
-
-        if not mock_mode:
-            self._load_models()
-
-    def _load_models(self):
-        """Load student and teacher models onto device."""
+    # ------------------------------------------------------------------ models
+    def _load_models(self, util_s: float, util_t: float):
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        print(f"[Phase 0] Loading Tokenizer from {self.teacher_model_path}...")
+        from vllm import LLM
+
+        print(f"[Phase 0] Tokenizer from {self.teacher_model_path}")
         self.tokenizer = AutoTokenizer.from_pretrained(self.teacher_model_path, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        max_len = self.max_resp_len + self.cont_max_tokens + 2048
+        print("[Phase 0] vLLM student (rollouts) / vLLM teacher (continuations)")
+        self.vllm_student = LLM(self.student_model_path, gpu_memory_utilization=util_s, dtype="bfloat16",
+                                trust_remote_code=True, seed=self.seed, max_model_len=max_len)
+        self.vllm_teacher = LLM(self.teacher_model_path, gpu_memory_utilization=util_t, dtype="bfloat16",
+                                trust_remote_code=True, seed=self.seed, max_model_len=max_len)
+        dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        print("[Phase 0] HF student / HF teacher (probing and local signals)")
+        self.hf_student = AutoModelForCausalLM.from_pretrained(
+            self.student_model_path, torch_dtype=dtype, trust_remote_code=True).to(self.device).eval()
+        self.hf_teacher = AutoModelForCausalLM.from_pretrained(
+            self.teacher_model_path, torch_dtype=dtype, trust_remote_code=True).to(self.device).eval()
 
-        print(f"[Phase 0] Loading Student Model from {self.student_model_path}...")
-        self.student_model = AutoModelForCausalLM.from_pretrained(
-            self.student_model_path,
-            torch_dtype=torch.bfloat16 if self.device.type == "cuda" else torch.float32,
-            device_map="auto" if self.device.type == "cuda" else None,
-            trust_remote_code=True,
-        )
-        self.student_model.eval()
+    # ------------------------------------------------------------------ data
+    def build_prompt_ids(self, messages) -> List[int]:
+        text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        return self.tokenizer.encode(text, add_special_tokens=False)
 
-        print(f"[Phase 0] Loading Teacher Model from {self.teacher_model_path}...")
-        self.teacher_model = AutoModelForCausalLM.from_pretrained(
-            self.teacher_model_path,
-            torch_dtype=torch.bfloat16 if self.device.type == "cuda" else torch.float32,
-            device_map="auto" if self.device.type == "cuda" else None,
-            trust_remote_code=True,
-        )
-        self.teacher_model.eval()
+    # ------------------------------------------------------------------ generation (vLLM, token ids in/out)
+    def sample_rollouts(self, prompt_ids: List[int], n: int) -> List[List[int]]:
+        """n student rollouts for one prompt; returns the sampled token ids (EOS stripped)."""
+        from vllm import SamplingParams
 
-    def sample_rollout(self, prompt: str) -> str:
-        """Sample one rollout from student model."""
-        if self.mock_mode:
-            return (
-                "To solve this problem, let's break it down into steps.\n\n"
-                "Step 1: Simplify the expression.\n"
-                "We calculate the initial values carefully.\n\n"
-                "Step 2: Apply the algebraic identity.\n"
-                "Substitute x = 5 into the main formula.\n\n"
-                "Step 3: Combine like terms and solve.\n"
-                "We find that the value satisfies the constraint.\n\n"
-                "Therefore, the final answer is \\boxed{5}."
-            )
+        sp = SamplingParams(n=n, temperature=1.0, max_tokens=self.max_resp_len)
+        out = self.vllm_student.generate([{"prompt_token_ids": prompt_ids}], sp, use_tqdm=False)[0]
+        eos = {self.tokenizer.eos_token_id, self.tokenizer.pad_token_id, 151643, 151645}
+        res = []
+        for o in out.outputs:
+            ids = list(o.token_ids)
+            while ids and ids[-1] in eos:
+                ids.pop()
+            res.append(ids)
+        return res
 
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            output_ids = self.student_model.generate(
-                **inputs,
-                max_new_tokens=2048,
-                temperature=1.0,
-                do_sample=True,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
-        resp_ids = output_ids[0, inputs.input_ids.shape[1]:]
-        return self.tokenizer.decode(resp_ids, skip_special_tokens=True)
+    def sample_teacher_continuations(self, ctx_ids_list: List[List[int]], m_list: List[int]) -> List[List[str]]:
+        """For each context, m teacher continuations (temperature 1.0) to the end of the response."""
+        from vllm import SamplingParams
 
-    def sample_teacher_continuations(
-        self,
-        prefix_text: str,
-        m_samples: int,
-        max_tokens: int = 1024,
-    ) -> List[str]:
-        """Sample M teacher continuations starting from prefix_text."""
-        if self.mock_mode:
-            outcomes = ["\\boxed{5}", "\\boxed{7}", "\\boxed{5}", "\\boxed{5}"]
-            return [random.choice(outcomes) for _ in range(m_samples)]
+        reqs, idx = [], []
+        for i, (ctx, m) in enumerate(zip(ctx_ids_list, m_list)):
+            if m > 0:
+                reqs.append({"prompt_token_ids": ctx})
+                idx.append(i)
+        texts: List[List[str]] = [[] for _ in ctx_ids_list]
+        if not reqs:
+            return texts
+        # one SamplingParams per request so that m can differ
+        sps = [SamplingParams(n=m_list[i], temperature=1.0, max_tokens=self.cont_max_tokens) for i in idx]
+        outs = self.vllm_teacher.generate(reqs, sps, use_tqdm=False)
+        for i, o in zip(idx, outs):
+            texts[i] = [c.text for c in o.outputs]
+        return texts
 
-        inputs = self.tokenizer(prefix_text, return_tensors="pt").to(self.device)
-        continuations = []
-        with torch.no_grad():
-            for _ in range(m_samples):
-                output_ids = self.teacher_model.generate(
-                    **inputs,
-                    max_new_tokens=max_tokens,
-                    temperature=1.0,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                )
-                cont_ids = output_ids[0, inputs.input_ids.shape[1]:]
-                continuations.append(self.tokenizer.decode(cont_ids, skip_special_tokens=True))
-        return continuations
+    def evaluate_boundaries(
+        self, ctx_ids_list: List[List[int]], candidate_answers: List[str], gold_answer: str
+    ) -> List[Tuple[Dict[str, float], float, int, Dict[str, float], Dict[str, float]]]:
+        """Adaptive sampling at all boundaries of one rollout: M=m_screen everywhere, up to m_adaptive where the
+        Wilson label is undetermined or the boundary neighbours a candidate transition."""
+        conts = self.sample_teacher_continuations(ctx_ids_list, [self.m_screen] * len(ctx_ids_list))
 
-    def evaluate_boundary_continuations(
-        self,
-        prefix_text: str,
-        candidate_answers: List[str],
-        gold_answer: str,
-    ) -> Tuple[Dict[str, float], float, int, Dict[str, float], Dict[str, float]]:
-        """Adaptive sampling of continuations to estimate alpha_P(h) and V(h)."""
-        # Step 1: Screen with M_screen = 8 continuations
-        conts = self.sample_teacher_continuations(prefix_text, self.m_screen)
-        
-        # Check success count
-        success_count = sum(1 for c in conts if are_answers_equivalent(extract_boxed_content(c) or "", gold_answer))
-        label = classify_boundary_label(success_count, len(conts), threshold=0.5, confidence=0.90)
+        def succ(cs):
+            return sum(1 for c in cs if are_answers_equivalent(extract_boxed_content(c) or "", gold_answer))
 
-        # Step 2: Adaptive expansion to M_adaptive = 32 if undetermined
-        if label == "undetermined":
-            extra_m = self.m_adaptive - self.m_screen
-            extra_conts = self.sample_teacher_continuations(prefix_text, extra_m)
-            conts.extend(extra_conts)
-
-        # Split into two halves for split-half reliability
-        half1 = conts[0::2]
-        half2 = conts[1::2]
+        labels = [classify_boundary_label(succ(cs), len(cs), threshold=0.5, confidence=0.90) for cs in conts]
+        # boundaries around a label transition also get more samples
+        need = [lab == "undetermined" for lab in labels]
+        for k in range(len(labels) - 1):
+            if labels[k] != labels[k + 1]:
+                need[k] = need[k + 1] = True
+        extra = self.sample_teacher_continuations(
+            ctx_ids_list, [self.m_adaptive - self.m_screen if nd else 0 for nd in need])
+        for k, e in enumerate(extra):
+            conts[k].extend(e)
 
         def compute_alpha(samples: List[str]) -> Tuple[Dict[str, float], float]:
             alpha: Dict[str, float] = {cand: 0.0 for cand in candidate_answers}
             alpha["bot"] = 0.0
+            n_total = max(1, len(samples))
             n_success = 0
-            n_total = len(samples)
-
             for text in samples:
                 boxed = extract_boxed_content(text) or ""
-                matched_cand = None
-                for cand in candidate_answers:
-                    if are_answers_equivalent(boxed, cand):
-                        matched_cand = cand
-                        break
-                if matched_cand:
-                    alpha[matched_cand] += 1.0 / n_total
-                else:
-                    alpha["bot"] += 1.0 / n_total
+                hit = next((c for c in candidate_answers if are_answers_equivalent(boxed, c)), None)
+                alpha[hit if hit else "bot"] += 1.0 / n_total
+                n_success += int(are_answers_equivalent(boxed, gold_answer))
+            return alpha, n_success / n_total
 
-                if are_answers_equivalent(boxed, gold_answer):
-                    n_success += 1
+        out = []
+        for cs in conts:
+            alpha_full, v_full = compute_alpha(cs)
+            out.append((alpha_full, v_full, len(cs), compute_alpha(cs[0::2])[0], compute_alpha(cs[1::2])[0]))
+        return out
 
-            v_val = n_success / (n_total + 1e-8)
-            return alpha, v_val
+    # ------------------------------------------------------------------ teacher scoring (HF)
+    def hf_score_fn(self, model, micro_bsz: int = 4):
+        """score_fn for teacher_probe: log p(responses | rest) per position, using the HF model."""
 
-        alpha_full, v_full = compute_alpha(conts)
-        alpha_half1, _ = compute_alpha(half1)
-        alpha_half2, _ = compute_alpha(half2)
+        def fn(input_ids, attention_mask, position_ids, responses):
+            R = responses.shape[1]
+            outs = []
+            for s in range(0, input_ids.shape[0], micro_bsz):
+                ii, am, pi = (t[s:s + micro_bsz].to(self.device) for t in (input_ids, attention_mask, position_ids))
+                with torch.no_grad():
+                    logits = model(input_ids=ii, attention_mask=am, position_ids=pi).logits
+                    lp = torch.log_softmax(logits[:, -R - 1:-1].float(), dim=-1)
+                    outs.append(lp.gather(-1, responses[s:s + micro_bsz].to(self.device).unsqueeze(-1)).squeeze(-1).cpu())
+            return torch.cat(outs, dim=0)
 
-        return alpha_full, v_full, len(conts), alpha_half1, alpha_half2
+        return fn
+
+    def martingale_gaps(self, prompt_ids, resp_ids, steps, candidates, beliefs, n_steps: int = 3) -> List[float]:
+        """TV(mean_s q(h o s), q(h)) at each boundary k < K, s ~ P_T(next paragraph | h)."""
+        from vllm import SamplingParams
+
+        ends = [0] + [st.token_end for st in steps]
+        reqs = [{"prompt_token_ids": prompt_ids + resp_ids[:e]} for e in ends[:-1]]
+        sp = SamplingParams(n=n_steps, temperature=1.0, max_tokens=512, stop=["\n\n"],
+                            include_stop_str_in_output=True)
+        outs = self.vllm_teacher.generate(reqs, sp, use_tqdm=False)
+        gaps = []
+        score_fn = self.hf_score_fn(self.hf_teacher)
+        for k, o in enumerate(outs):
+            avg: Dict[str, float] = {}
+            m = 0
+            for c in o.outputs:
+                new_ids = list(c.token_ids)
+                if not new_ids:
+                    continue
+                pr, _ = probe_batch([prompt_ids], [resp_ids[:ends[k]] + new_ids], [candidates], self.tokenizer,
+                                    score_fn, pad_token_id=self.tokenizer.pad_token_id, max_steps=1,
+                                    strip_trailing_ids=[self.tokenizer.eos_token_id])
+                q_next = pr[0].beliefs[-1]
+                for key, val in q_next.items():
+                    avg[key] = avg.get(key, 0.0) + val
+                m += 1
+            if m:
+                gaps.append(compute_total_variation({kk: vv / m for kk, vv in avg.items()}, beliefs[k]))
+        return gaps
+
+    def local_signals(self, prompt_ids: List[int], resp_ids: List[int], steps: List[StepBoundary]):
+        """Per-step student/teacher entropy, KL(student||teacher), teacher surprisal and |1 - r_k| from the models."""
+        ids = torch.tensor([prompt_ids + resp_ids], device=self.device)
+        P, R = len(prompt_ids), len(resp_ids)
+        with torch.no_grad():
+            ls = self.hf_student(ids).logits[0, P - 1:P + R - 1].float()
+            lt = self.hf_teacher(ids).logits[0, P - 1:P + R - 1].float()
+        lps, lpt = torch.log_softmax(ls, -1), torch.log_softmax(lt, -1)
+        ps, pt = lps.exp(), lpt.exp()
+        tgt = ids[0, P:P + R]
+        ent_s, ent_t = -(ps * lps).sum(-1), -(pt * lpt).sum(-1)
+        kl = (ps * (lps - lpt)).sum(-1)
+        a_t = lpt.gather(-1, tgt[:, None])[:, 0] - lps.gather(-1, tgt[:, None])[:, 0]
+        surpr = -lpt.gather(-1, tgt[:, None])[:, 0]
+        res = []
+        for st in steps:
+            sl = slice(st.token_start, st.token_end)
+            r_k = float(torch.exp(a_t[sl].sum().clamp(-30, 30)))
+            res.append((float(ent_s[sl].mean()), float(ent_t[sl].mean()), float(kl[sl].mean()),
+                        float(surpr[sl].mean()), abs(1.0 - r_k)))
+        return res
 
     def run_pilot(self, math_dataset: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Execute the full Phase 0 Pilot evaluation on problems."""
@@ -321,64 +369,81 @@ class Phase0Runner:
         large_shift_errors: List[float] = []
         large_mismatch_errors: List[float] = []
 
+        martingale_gaps: List[float] = []
         all_steps: List[StepEvaluation] = []
         before_answer_steps: List[StepEvaluation] = []
 
         for p_idx, item in enumerate(math_dataset):
-            prompt = item.get("prompt", "")
-            gold = item.get("ground_truth", "")
+            gold = item["ground_truth"]
+            prompt = item["question"]
             p_id = get_prompt_hash(prompt)
+            prompt_ids = item["prompt_ids"]
 
-            # Get teacher greedy answer
-            a_T = item.get("teacher_answer", gold)
+            # a_T: cached greedy teacher answer (never checked against gold)
+            a_T = item.get("teacher_answer") or "None"
             self.candidate_manager.register_teacher_answer(p_id, a_T)
+
+            # Rollout 0 is evaluated; the others play the role of earlier-epoch rollouts (history H_x),
+            # so C_x is fixed before (and independent of) the evaluated rollout, as in training.
+            rollouts = self.sample_rollouts(prompt_ids, 1 + self.n_history)
+            resp_ids = rollouts[0]
+            for extra in rollouts[1:]:
+                ans = extract_boxed_content(self.tokenizer.decode(extra, skip_special_tokens=True))
+                if ans:
+                    self.candidate_manager.update_history_answer(p_id, canonicalize_answer(ans))
             candidates = self.candidate_manager.get_candidate_set(p_id)
+            if not candidates or not resp_ids:
+                print(f"[Phase 0] skipping prompt {p_idx}: no candidates or empty rollout")
+                continue
 
-            # Sample student rollout
-            response = self.sample_rollout(prompt)
-            steps = split_response_into_steps(response)
+            steps = segment_token_ids(resp_ids, self.tokenizer)
             K = len(steps)
-
+            response = self.tokenizer.decode(resp_ids, skip_special_tokens=True)
             student_ans = extract_boxed_content(response)
             student_correct = are_answers_equivalent(student_ans or "", gold)
             teacher_correct = are_answers_equivalent(a_T, gold)
 
-            # Locate first token/step where final answer appears
-            answer_step_idx = K + 1
+            answer_step_idx = K + 1  # first step containing the final answer string
             if student_ans:
-                for s in steps:
-                    if student_ans in s.text:
-                        answer_step_idx = s.step_idx
+                for st in steps:
+                    if student_ans in st.text:
+                        answer_step_idx = st.step_idx
                         break
 
-            # Evaluate probed beliefs at all boundaries k = 0 .. K
-            prefixes: List[str] = [prompt]
-            curr_text = prompt
-            for s in steps:
-                curr_text = curr_text + "\n\n" + s.text
-                prefixes.append(curr_text)
+            # Probed beliefs q_0..q_K with the very code used in training (HF teacher), timed for P3
+            t0 = time.time()
+            probes, pstats = probe_batch(
+                [prompt_ids], [resp_ids], [candidates], self.tokenizer, self.hf_score_fn(self.hf_teacher),
+                pad_token_id=self.tokenizer.pad_token_id, strip_trailing_ids=[self.tokenizer.eos_token_id])
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            self.timing["probe_s"] += time.time() - t0
+            self.timing["probe_tokens"] += pstats["probe_tokens"]
+            probed_beliefs = probes[0].beliefs
 
-            probed_beliefs = self.probe_scorer.score_candidates_batch(
-                teacher_model=self.teacher_model,
-                tokenizer=self.tokenizer,
-                prefix_texts=prefixes,
-                candidate_answers=candidates,
-                device=self.device,
-            )
+            # Reference cost: one plain teacher scoring pass of the same rollout (what OPD already pays)
+            t0 = time.time()
+            with torch.no_grad():
+                self.hf_teacher(torch.tensor([prompt_ids + resp_ids], device=self.device))
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            self.timing["plain_teacher_s"] += time.time() - t0
+            self.timing["plain_teacher_tokens"] += len(prompt_ids) + len(resp_ids)
 
-            # Evaluate continuations at each boundary k = 0 .. K
+            local = self.local_signals(prompt_ids, resp_ids, steps)
+            martingale_gaps.extend(self.martingale_gaps(prompt_ids, resp_ids, steps, candidates, probed_beliefs))
+
+            # Continuations from every boundary k = 0..K (teacher continues the student's prefix)
+            ctxs = [prompt_ids + resp_ids[:(steps[k - 1].token_end if k > 0 else 0)] for k in range(K + 1)]
+            bound_stats = self.evaluate_boundaries(ctxs, candidates, gold)
+
             boundary_evals: List[BoundaryEvaluation] = []
             alphas_half1: List[Dict[str, float]] = []
             alphas_half2: List[Dict[str, float]] = []
 
             for k in range(K + 1):
-                pref = prefixes[k]
                 rel_pos = k / max(1, K)
-                alpha, v_rate, n_cont, a1, a2 = self.evaluate_boundary_continuations(
-                    prefix_text=pref,
-                    candidate_answers=candidates,
-                    gold_answer=gold,
-                )
+                alpha, v_rate, n_cont, a1, a2 = bound_stats[k]
                 alphas_half1.append(a1)
                 alphas_half2.append(a2)
 
@@ -429,14 +494,10 @@ class Phase0Runner:
                 v_diff = boundary_evals[k].gold_success_rate - boundary_evals[k - 1].gold_success_rate
                 v_changes.append(v_diff)
 
-                # Local baseline signals (simulated or computed)
+                # Local baseline signals, computed from the models
                 step_len = steps[k - 1].token_len
                 rel_pos = k / K
-                s_ent = float(0.5 + 0.3 * np.sin(k))
-                t_ent = float(0.4 + 0.2 * np.cos(k))
-                div_kl = float(max(0.01, abs(s_ent - t_ent) * 0.8))
-                surprisal = float(0.2 + div_kl * 0.5)
-                mismatch = float(min(1.5, div_kl * 1.2))
+                s_ent, t_ent, div_kl, surprisal, mismatch = local[k - 1]
 
                 if g_P > 0.3:
                     large_shift_errors.append(boundary_evals[k].probe_error)
@@ -459,6 +520,7 @@ class Phase0Runner:
                     teacher_surprisal=surprisal,
                     mismatch_ratio=mismatch,
                     before_answer=is_before,
+                    delta_q_aT=probed_beliefs[k][candidates[0]] - probed_beliefs[k - 1][candidates[0]],
                 )
                 step_evals.append(s_eval)
                 all_steps.append(s_eval)
@@ -539,14 +601,17 @@ class Phase0Runner:
                     y_pred = X_design @ beta
                     ss_tot = np.sum((y_vec - np.mean(y_vec)) ** 2)
                     ss_res = np.sum((y_vec - y_pred) ** 2)
-                    r2 = 1.0 - (ss_res / (ss_tot + 1e-8))
-                    return max(0.0, float(r2))
+                    r2 = 1.0 - (ss_res / (ss_tot + 1e-12))
+                    n_obs, n_par = len(y_vec), X_design.shape[1]
+                    if n_obs <= n_par:
+                        return 0.0
+                    return float(1.0 - (1.0 - r2) * (n_obs - 1) / (n_obs - n_par))  # adjusted R^2, not clamped
                 except Exception:
                     return 0.0
 
             r2_base = fit_r2(X_base, y)
             r2_ext = fit_r2(X_ext, y)
-            delta_r2 = max(0.0, r2_ext - r2_base)
+            delta_r2 = r2_ext - r2_base  # adjusted R^2 gain; may be negative
 
             # Partial Spearman rank correlation
             # Regress g_vec on X_base, regress y on X_base, correlate residuals
@@ -560,6 +625,7 @@ class Phase0Runner:
             # Clustered Bootstrap by rollout (1000 resamples)
             n_boot = 500
             boot_deltas = []
+            step_ids = {id(s) for s in step_list}
             n_rollouts = len(rollout_evals)
             for _ in range(n_boot):
                 sampled_rollout_ids = np.random.choice(n_rollouts, size=n_rollouts, replace=True)
@@ -567,7 +633,7 @@ class Phase0Runner:
                 for r_id in sampled_rollout_ids:
                     r_ev = rollout_evals[r_id]
                     for s in r_ev.steps:
-                        if s in step_list:
+                        if id(s) in step_ids:
                             boot_steps.append(s)
                 if len(boot_steps) > 10:
                     X_b_b = np.column_stack([
@@ -580,7 +646,7 @@ class Phase0Runner:
                     ])
                     X_e_b = np.column_stack([X_b_b, [s.probed_shift for s in boot_steps]])
                     y_b = np.array([s.continuation_shift for s in boot_steps])
-                    d_r2 = max(0.0, fit_r2(X_e_b, y_b) - fit_r2(X_b_b, y_b))
+                    d_r2 = fit_r2(X_e_b, y_b) - fit_r2(X_b_b, y_b)
                     boot_deltas.append(d_r2)
 
             if boot_deltas:
@@ -609,9 +675,9 @@ class Phase0Runner:
         # -------------------------------------------------------------
         # P1(c): Martingale Gap of q along teacher steps
         # -------------------------------------------------------------
-        # Average || E_s[q(h o s)] - q(h) ||_1
-        martingale_gaps = [float(abs(s.probed_shift - s.continuation_shift)) for s in all_steps]
-        mean_martingale_gap = float(np.mean(martingale_gaps)) if martingale_gaps else 0.0
+        # Teacher steps are sampled at each boundary (vLLM, stop at the paragraph break) and probed with the same
+        # code; gap_k = TV(E_s q(h o s), q(h)). A necessary check of calibration only.
+        mean_martingale_gap = float(np.mean(martingale_gaps)) if martingale_gaps else float("nan")
 
         # -------------------------------------------------------------
         # P2: Early Detection & Transitions Before Answer
@@ -622,23 +688,23 @@ class Phase0Runner:
 
         # Signed agreement between probe change and Delta V_k
         teacher_correct_rollouts = [r for r in rollout_evals if r.teacher_is_correct]
+        # Signed agreement: sign(q_k(a_T) - q_{k-1}(a_T)) vs sign(Delta V_k), only where a_T is correct
+        # (a_T is candidate 0 by construction) and both changes are non-negligible.
         signed_agreements = []
         for r in teacher_correct_rollouts:
-            for s in r.steps:
-                # Sign agreement: (Delta q(a_T) > 0 and Delta V > 0) or (Delta q(a_T) < 0 and Delta V < 0)
-                q_diff = s.probed_shift if s.v_change >= 0 else -s.probed_shift
-                if (q_diff * s.v_change) >= 0:
-                    signed_agreements.append(1.0)
-                else:
-                    signed_agreements.append(0.0)
-        mean_signed_agreement = float(np.mean(signed_agreements)) if signed_agreements else 0.75
+            for st in r.steps:
+                if abs(st.v_change) > 0.1 and abs(st.delta_q_aT) > 0.01:
+                    signed_agreements.append(float(np.sign(st.delta_q_aT) == np.sign(st.v_change)))
+        mean_signed_agreement = float(np.mean(signed_agreements)) if signed_agreements else float("nan")
 
         # -------------------------------------------------------------
         # P3: Overhead Benchmark
         # -------------------------------------------------------------
-        # Estimate / benchmark latency
-        t_base = 1.00  # Normalized baseline
-        t_method = 1.18 # Measured with batch probe forward passes
+        # Measured: HF-teacher time for all probe sequences vs one plain teacher pass over the same rollouts.
+        # This is the overhead of the teacher stage only; the whole-step overhead of P3 (which also contains
+        # rollout generation and the student update) must be measured in a training run (cw/probe_time_s).
+        t_base = max(self.timing["plain_teacher_s"], 1e-9)
+        t_method = self.timing["plain_teacher_s"] + self.timing["probe_s"]
         overhead_pct = ((t_method - t_base) / t_base) * 100.0
 
         # -------------------------------------------------------------
@@ -649,11 +715,8 @@ class Phase0Runner:
         delta_r2_before = stats_before_answer["delta_r2"]
         ci_low_before, ci_high_before = stats_before_answer["delta_r2_90ci"]
         
-        # In mock or real mode, check condition
-        decision_go = (delta_r2_before > 0.01) and (ci_low_before > 0.0)
-        if self.mock_mode:
-            # Synthetic validation passes
-            decision_go = True
+        # Proposal (Phase 0, Decision): continue iff the gain is positive with an interval excluding zero
+        decision_go = bool(delta_r2_before > 0.0 and ci_low_before > 0.0)
 
         results = {
             "p1_calibration": {
@@ -735,7 +798,7 @@ def generate_markdown_report(results: Dict[str, Any], output_path: str):
 
 ### 4. P2 — Early Detection Before the Answer Appears
 * **Unrecoverable Transition Identification Rate**: `{results['p2_early_detection']['unrecoverable_transition_rollout_fraction'] * 100.0:.1f}%`
-* **Signed Directional Agreement $\\mathrm{{sign}}(\\Delta q) = \\mathrm{{sign}}(\\Delta V)$**: `{results['p2_early_detection']['signed_agreement_rate'] * 100.0:.1f}%`
+* **Signed Directional Agreement $\\mathrm{{sign}}(\\Delta q) = \\mathrm{{sign}}(\\Delta V)$**: `{results['p2_early_detection']['signed_agreement_rate'] * 100.0:.1f}%` (nan = no step with a non-negligible change)
 
 ---
 
@@ -751,6 +814,29 @@ def generate_markdown_report(results: Dict[str, Any], output_path: str):
     print(f"[Phase 0] Markdown report written to {output_path}")
 
 
+def load_math_subset(data_path: str, teacher_cache: str, n: int, seed: int, build_prompt_ids) -> List[Dict[str, Any]]:
+    """MATH prompts with gold (analysis only) and cached a_T; prompts without a_T are skipped."""
+    import pandas as pd
+
+    df = pd.read_parquet(data_path)
+    with open(teacher_cache, "r", encoding="utf-8") as f:
+        cache = json.load(f)
+    order = np.random.RandomState(seed).permutation(len(df))
+    items = []
+    for i in order:
+        row = df.iloc[int(i)]
+        msgs = [dict(m) for m in list(row["prompt"])]
+        q = question_text_from_messages(msgs)
+        a_T = cache.get(get_prompt_hash(q))
+        if a_T in (None, "", "None"):
+            continue
+        items.append({"question": q, "ground_truth": str(row["reward_model"]["ground_truth"]),
+                      "teacher_answer": a_T, "prompt_ids": build_prompt_ids(msgs)})
+        if len(items) >= n:
+            break
+    return items
+
+
 def main():
     parser = argparse.ArgumentParser(description="Phase 0 Pilot Experiment Suite for Consequence-Weighted OPD")
     parser.add_argument("--student_model", default="Qwen/Qwen3-1.7B-Base", help="Student model path or name")
@@ -758,20 +844,14 @@ def main():
     parser.add_argument("--num_prompts", type=int, default=100, help="Number of MATH prompts to evaluate")
     parser.add_argument("--m_screen", type=int, default=8, help="Screening continuations per boundary")
     parser.add_argument("--m_adaptive", type=int, default=32, help="Adaptive continuations for ambiguous boundaries")
-    parser.add_argument("--mock", action="store_true", help="Run in mock/dry-run mode without GPU loading")
-    parser.add_argument("--output_dir", default="phase0_output", help="Directory for JSON and report output")
+    parser.add_argument("--data_path", default="data/math/train.parquet", help="MATH train parquet")
+    parser.add_argument("--teacher_cache", default="data/math/teacher_answers_qwen3_8b.json", help="cached a_T")
+    parser.add_argument("--n_history", type=int, default=2, help="extra student rollouts used as earlier-epoch history")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--output_dir", default="experiments/phase0_pilot", help="Directory for JSON and report output")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-
-    # Prepare sample prompts
-    prompts_list = []
-    for i in range(args.num_prompts):
-        prompts_list.append({
-            "prompt": f"Let's think step by step and output the final answer within \\boxed{{}}. Problem {i+1}: Compute the value of x when 2*x + 4 = 14.",
-            "ground_truth": "5",
-            "teacher_answer": "5",
-        })
 
     runner = Phase0Runner(
         student_model_path=args.student_model,
@@ -779,8 +859,12 @@ def main():
         num_prompts=args.num_prompts,
         m_screen=args.m_screen,
         m_adaptive=args.m_adaptive,
-        mock_mode=args.mock,
+        n_history=args.n_history,
+        seed=args.seed,
     )
+    prompts_list = load_math_subset(args.data_path, args.teacher_cache, args.num_prompts, args.seed,
+                                    runner.build_prompt_ids)
+    print(f"[Phase 0] {len(prompts_list)} MATH prompts with cached a_T")
 
     results = runner.run_pilot(prompts_list)
 

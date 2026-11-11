@@ -199,3 +199,186 @@ def test_fuw_loss():
 
     assert loss.requires_grad
     assert "actor/fuw_advantage" in metrics
+
+
+# ----------------------------------------------------------------------------------------
+# Token-exact probing (teacher_probe.py) with a fake char-level tokenizer and fake teacher
+# ----------------------------------------------------------------------------------------
+from verl.trainer.ppo.cw_opd.candidate_manager import (  # noqa: E402
+    extract_question_from_chat_prompt,
+    get_prompt_hash,
+    question_text_from_messages,
+)
+from verl.trainer.ppo.cw_opd.probe_scorer import shifts_from_beliefs  # noqa: E402
+from verl.trainer.ppo.cw_opd.teacher_probe import (  # noqa: E402
+    BOT_KEY,
+    probe_batch,
+    segment_token_ids,
+    tokenize_probe_and_candidate,
+)
+
+
+class CharTokenizer:
+    """One token per character (so '\\n\\n' is two tokens: exercises cross-token separator detection)."""
+
+    eos_token_id = 0
+    pad_token_id = 0
+
+    def encode(self, text, add_special_tokens=False):
+        return [ord(c) for c in text]
+
+    def decode(self, ids, skip_special_tokens=False):
+        return "".join(chr(i) for i in ids if i != 0)
+
+
+def fake_teacher(tok):
+    """Believes 5 unless the context contains 'BAD', then believes 7. Mass 0.8/0.05 on the listed candidates."""
+
+    def score_fn(input_ids, attention_mask, position_ids, responses):
+        out = torch.full(responses.shape, 0.0)
+        for b in range(input_ids.shape[0]):
+            row = input_ids[b][attention_mask[b].bool()].tolist()
+            n_resp = int((responses[b] != 0).sum().item())
+            ctx, cand = tok.decode(row[: len(row) - n_resp]), tok.decode(row[len(row) - n_resp:])
+            fav = "7}" if "BAD" in ctx else "5}"
+            p = 0.8 if cand == fav else 0.05
+            out[b, 0] = float(torch.log(torch.tensor(p)))
+        return out
+
+    return score_fn
+
+
+def test_segment_token_ids_exact_alignment():
+    tok = CharTokenizer()
+    text = "Step one.\n\nStep two BAD.\n\n\nStep three \\boxed{7}"
+    ids = tok.encode(text)
+    steps = segment_token_ids(ids, tok)
+    assert len(steps) == 3
+    # the steps tile the response exactly, with no gaps and no overlap
+    assert steps[0].token_start == 0 and steps[-1].token_end == len(ids)
+    for a, b in zip(steps, steps[1:]):
+        assert a.token_end == b.token_start
+    assert "".join(s.text for s in steps) == text
+    assert steps[0].text == "Step one.\n\n"
+
+
+def test_segment_falls_back_to_single_newline_and_caps_steps():
+    tok = CharTokenizer()
+    ids = tok.encode("a\nb\nc\nd\ne")
+    assert len(segment_token_ids(ids, tok)) == 5
+    assert len(segment_token_ids(ids, tok, max_steps=2)) == 2
+    assert segment_token_ids(ids, tok, max_steps=2)[-1].token_end == len(ids)
+
+
+def test_probe_batch_detects_belief_shift_at_the_right_step():
+    tok = CharTokenizer()
+    resp = "Step one.\n\nStep two BAD.\n\nStep three."
+    prompt = "Q?"
+    probes, stats = probe_batch(
+        prompt_ids_list=[tok.encode(prompt)],
+        resp_ids_list=[tok.encode(resp) + [0]],  # trailing EOS/pad must not enter the context
+        candidates_list=[["5", "7"]],
+        tokenizer=tok,
+        score_fn=fake_teacher(tok),
+        pad_token_id=0,
+        strip_trailing_ids=[0],
+    )
+    pr = probes[0]
+    assert len(pr.beliefs) == len(pr.steps) + 1 == 4
+    # q_0, q_1: teacher says 5 (0.8), 7 (0.05), residual 0.15
+    assert abs(pr.beliefs[0]["5"] - 0.8) < 1e-5 and abs(pr.beliefs[0][BOT_KEY] - 0.15) < 1e-5
+    # after step 2 the context contains BAD: the belief flips
+    assert abs(pr.beliefs[2]["7"] - 0.8) < 1e-5
+    g = shifts_from_beliefs(pr.beliefs, pr.steps)
+    assert g[0] < 1e-6 and g[2] < 1e-6
+    assert abs(g[1] - 0.75) < 1e-5  # 0.5 * (|0.05-0.8| + |0.8-0.05| + 0)
+    assert stats["probe_sequences"] == 4 * 2
+
+
+def test_probe_with_no_candidates_gives_zero_shift_not_a_dummy():
+    tok = CharTokenizer()
+    probes, _ = probe_batch(
+        [tok.encode("Q")], [tok.encode("a\n\nb")], [[]], tok, fake_teacher(tok), pad_token_id=0
+    )
+    assert shifts_from_beliefs(probes[0].beliefs, probes[0].steps) == [0.0, 0.0]
+
+
+def test_probe_scorer_refuses_silent_mock():
+    scorer = ProbeScorer()
+    with pytest.raises(ValueError):
+        scorer.compute_rollout_shifts("Q", "a\n\nb", ["5"], teacher_model=None, tokenizer=None)
+
+
+def test_tokenize_probe_and_candidate_splits_joint_tokenization():
+    tok = CharTokenizer()
+    probe_ids, cand_ids, retok = tokenize_probe_and_candidate(tok, "12")
+    assert tok.decode(cand_ids) == "12}" and not retok
+    assert tok.decode(probe_ids).endswith("\\boxed{")
+
+
+def test_prompt_key_matches_between_cache_and_trainer():
+    raw = "What is $2+3$?  Let's think step by step and output the final answer within \\boxed{}."
+    dataset_key = get_prompt_hash(question_text_from_messages([{"role": "user", "content": raw}]))
+    templated = f"<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\n{raw}<|im_end|>\n<|im_start|>assistant\n"
+    assert get_prompt_hash(extract_question_from_chat_prompt(templated)) == dataset_key
+
+
+def test_shift_variants_from_beliefs():
+    steps = [StepBoundary(1, 0, 2, 2, "a"), StepBoundary(2, 2, 6, 4, "b")]
+    beliefs = [{"5": 0.6, BOT_KEY: 0.4}, {"5": 0.6, BOT_KEY: 0.4}, {"5": 0.1, BOT_KEY: 0.9}]
+    assert shifts_from_beliefs(beliefs, steps) == [0.0, pytest.approx(0.5)]
+    assert shifts_from_beliefs(beliefs, steps, "length_norm")[1] == pytest.approx(0.5 / 4)
+    assert shifts_from_beliefs(beliefs, steps, "kl_variant")[1] > 0
+
+
+def test_trainer_end_to_end_cpu(tmp_path):
+    """Drive CWOPDTrainer._compute_ref_log_prob's CW part with a fake teacher and a hand-built batch."""
+    pytest.importorskip("torchdata")
+    from verl import DataProto
+    from verl.trainer.ppo.cw_opd.cw_opd_trainer import CWOPDTrainer
+
+    tok = CharTokenizer()
+    question = "What is 2+3?"
+    prompt = f"<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+    resp = "Step one.\n\nStep two BAD.\n\nStep three."
+
+    t = object.__new__(CWOPDTrainer)
+    t.tokenizer = tok
+    t.candidate_manager = CandidateManager()
+    t.candidate_manager.register_teacher_answer(get_prompt_hash(question), "5")
+    t.candidate_manager.update_history_answer(get_prompt_hash(question), "7")  # earlier-epoch answer
+    t.ablation_mode, t.max_steps, t.probe_chunk_size, t.dump_every, t.seed = "none", 0, 8, 1, 0
+    t.log_dir, t.history_path = str(tmp_path), str(tmp_path / "h.json")
+    t._extra_metrics, t._cum_probe_tokens, t._cum_probe_time, t.global_steps = {}, 0.0, 0.0, 1
+    t.ref_policy_wg = SimpleNamespace(world_size=1)
+    fake = fake_teacher(tok)
+    t._teacher_score_fn = lambda *a: fake(*a)
+
+    p_ids, r_ids = tok.encode(prompt), tok.encode(resp)
+    P, R = len(p_ids) + 3, len(r_ids) + 5  # left-pad prompt, right-pad response
+    prompts = torch.tensor([[0] * 3 + p_ids])
+    responses = torch.tensor([r_ids + [0] * 5])
+    mask = torch.tensor([[0] * 3 + [1] * len(p_ids) + [1] * len(r_ids) + [0] * 5])
+    batch = DataProto.from_dict(
+        tensors={
+            "prompts": prompts,
+            "responses": responses,
+            "attention_mask": mask,
+            "response_mask": mask[:, P:],
+            "input_ids": torch.cat([prompts, responses], dim=1),
+        }
+    )
+    w, metrics = t._compute_consequence_weights(batch)
+
+    assert w.shape == responses.shape
+    assert abs(w[mask[:, P:].bool()].mean().item() - 1.0) < 1e-4
+    # the step that introduces BAD (step 2) must carry the largest weight
+    steps_end = [len("Step one.\n\n"), len("Step one.\n\nStep two BAD.\n\n"), len(resp)]
+    assert w[0, steps_end[0] + 1].item() > w[0, 1].item()
+    assert w[0, steps_end[0] + 1].item() > w[0, steps_end[1] + 1].item()
+    assert metrics["cw/aT_cache_miss_frac"] == 0.0
+    assert metrics["cw/n_candidates_mean"] == 2.0
+    assert metrics["cw/g_tv_max"] == pytest.approx(0.75, abs=1e-4)
+    assert metrics["cw/probe_sequences"] == 4 * 2
+    # trace file written and the rollout's own answer was added to H_x only after weighting
+    assert (tmp_path / "probe_step000001.jsonl").exists()

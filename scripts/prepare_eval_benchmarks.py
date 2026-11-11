@@ -62,54 +62,77 @@ def prepare_math500(output_dir: str):
         ds = datasets.load_dataset("HuggingFaceH4/MATH-500", split="test")
         records = []
         for i, item in enumerate(ds):
-            records.append(process_example(item["problem"], item["solution"], "math500", i))
+            # data_source must be one verl's reward dispatcher knows: MATH500 is used for in-training validation
+            records.append(process_example(item["problem"], item["solution"], "HuggingFaceH4/MATH-500", i))
         pd.DataFrame(records).to_parquet(os.path.join(output_dir, "math500.parquet"))
         print(f"  MATH500: Saved {len(records)} examples.")
-    except Exception as e:
-        print(f"  Warning: Could not fetch MATH500 ({e}).")
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"  ERROR: could not fetch MATH500 ({e}).")
+        return False
 
 
-def prepare_aime24(output_dir: str):
-    print("\n[DataPrep] Preparing AIME24...")
+def _first_available(candidates, split_names=("test", "train")):
+    """Try (repo, config) candidates in order; return the first dataset that loads."""
+    last = None
+    for repo, cfg in candidates:
+        for split in split_names:
+            try:
+                return datasets.load_dataset(repo, cfg, split=split) if cfg else datasets.load_dataset(repo, split=split)
+            except Exception as e:  # noqa: BLE001
+                last = e
+    raise RuntimeError(f"none of {[c[0] for c in candidates]} could be loaded ({last})")
+
+
+def _pick(item, keys, default=""):
+    for k in keys:
+        if k in item and item[k] not in (None, ""):
+            return item[k]
+    return default
+
+
+def _prepare(output_dir, name, candidates, q_keys, a_keys):
+    print(f"\n[DataPrep] Preparing {name}...")
     try:
-        ds = datasets.load_dataset("math-ai/aime24", split="test")
+        ds = _first_available(candidates)
         records = []
         for i, item in enumerate(ds):
-            sol = item.get("solution", item.get("answer", ""))
-            records.append(process_example(item["problem"], sol, "aime24", i))
-        pd.DataFrame(records).to_parquet(os.path.join(output_dir, "aime24.parquet"))
-        print(f"  AIME24: Saved {len(records)} examples.")
-    except Exception as e:
-        print(f"  Warning: Could not fetch AIME24 ({e}).")
+            ans = _pick(item, a_keys)
+            if isinstance(ans, list):
+                ans = ans[0] if ans else ""
+            records.append(process_example(str(_pick(item, q_keys)), str(ans), name, i))
+        pd.DataFrame(records).to_parquet(os.path.join(output_dir, f"{name}.parquet"))
+        print(f"  {name}: saved {len(records)} examples.")
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"  ERROR: could not prepare {name}: {e}")
+        return False
 
 
-def prepare_aime25(output_dir: str):
-    print("\n[DataPrep] Preparing AIME25...")
-    try:
-        ds = datasets.load_dataset("math-ai/aime25", split="test")
-        records = []
-        for i, item in enumerate(ds):
-            sol = item.get("solution", item.get("answer", ""))
-            records.append(process_example(item["problem"], sol, "aime25", i))
-        pd.DataFrame(records).to_parquet(os.path.join(output_dir, "aime25.parquet"))
-        print(f"  AIME25: Saved {len(records)} examples.")
-    except Exception as e:
-        print(f"  Warning: Could not fetch AIME25 ({e}).")
+def prepare_aime24(output_dir):
+    return _prepare(output_dir, "aime24", [("math-ai/aime24", None), ("HuggingFaceH4/aime_2024", None)],
+                    ["problem", "question"], ["solution", "answer"])
 
 
-def prepare_olympiadbench(output_dir: str):
-    print("\n[DataPrep] Preparing OlympiadBench...")
-    try:
-        ds = datasets.load_dataset("open-compass/OlympiadBench", "OE_TO_maths_en_COMP", split="test")
-        records = []
-        for i, item in enumerate(ds):
-            q = item.get("question", item.get("problem", ""))
-            sol = item.get("solution", item.get("final_answer", [""])[0] if isinstance(item.get("final_answer"), list) else str(item.get("final_answer", "")))
-            records.append(process_example(q, sol, "olympiadbench", i))
-        pd.DataFrame(records).to_parquet(os.path.join(output_dir, "olympiadbench.parquet"))
-        print(f"  OlympiadBench: Saved {len(records)} examples.")
-    except Exception as e:
-        print(f"  Warning: Could not fetch OlympiadBench ({e}).")
+def prepare_aime25(output_dir):
+    return _prepare(output_dir, "aime25", [("math-ai/aime25", None), ("opencompass/AIME2025", "AIME2025-I")],
+                    ["problem", "question"], ["answer", "solution"])
+
+
+def prepare_amc23(output_dir):
+    return _prepare(output_dir, "amc23", [("math-ai/amc23", None), ("AI-MO/aimo-validation-amc", None)],
+                    ["question", "problem"], ["answer", "solution"])
+
+
+def prepare_minerva_math(output_dir):
+    return _prepare(output_dir, "minerva_math", [("math-ai/minervamath", None), ("knoveleng/Minerva-Math", None)],
+                    ["question", "problem"], ["answer", "solution"])
+
+
+def prepare_olympiadbench(output_dir):
+    return _prepare(output_dir, "olympiadbench",
+                    [("math-ai/olympiadbench", None), ("Hothan/OlympiadBench", "OE_TO_maths_en_COMP")],
+                    ["question", "problem"], ["final_answer", "answer", "solution"])
 
 
 def main():
@@ -118,11 +141,20 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    prepare_math500(args.output_dir)
-    prepare_aime24(args.output_dir)
-    prepare_aime25(args.output_dir)
-    prepare_olympiadbench(args.output_dir)
-    print(f"\n[DataPrep] Finished benchmark dataset preparation into {args.output_dir}\n")
+    results = {
+        "math500": prepare_math500(args.output_dir),
+        "aime24": prepare_aime24(args.output_dir),
+        "aime25": prepare_aime25(args.output_dir),
+        "amc23": prepare_amc23(args.output_dir),
+        "minerva_math": prepare_minerva_math(args.output_dir),
+        "olympiadbench": prepare_olympiadbench(args.output_dir),
+    }
+    print(f"\n[DataPrep] Summary: {results}")
+    missing = [k for k, ok in results.items() if not ok]
+    if missing:
+        print(f"[DataPrep] MISSING benchmarks: {missing}. Fix the dataset ids (HF hub) or place parquet files manually.")
+        sys.exit(1)
+    print(f"[DataPrep] All 6 benchmarks written to {args.output_dir}")
 
 
 if __name__ == "__main__":

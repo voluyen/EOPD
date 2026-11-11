@@ -172,3 +172,37 @@ Hoặc chạy từng giai đoạn độc lập:
 * `bash scripts/run_all_experiments_master.sh table1`: Chạy toàn bộ 6 mô hình Bảng 1.
 * `bash scripts/run_all_experiments_master.sh table2`: Chạy toàn bộ 3 ablations Bảng 2.
 * `bash scripts/run_all_experiments_master.sh eval`: Đánh giá kết quả trên 6 benchmarks.
+
+
+---
+
+## 7. Cập nhật mới: thiết lập server → huấn luyện → log (bản sửa lỗi)
+
+### Thứ tự chạy từ máy trống
+```bash
+bash scripts/setup_server.sh                 # env python, torch/vllm/flash-attn, verl, chạy unit tests
+export HF_TOKEN=...; wandb login             # hoặc WANDB_MODE=offline|disabled
+bash scripts/download_models.sh              # Qwen3-8B (teacher) + Qwen3-1.7B-Base (student) -> ./models
+bash scripts/run_all_experiments_master.sh data     # MATH train + 6 benchmark (báo lỗi nếu thiếu benchmark nào)
+bash scripts/run_all_experiments_master.sh cache    # a_T (greedy, chat template, non-thinking, vLLM)
+bash scripts/run_all_experiments_master.sh phase0   # đọc experiments/phase0_pilot/phase0_report.md -> GO/NO-GO
+bash scripts/run_all_experiments_master.sh table1   # OPD, EOPD, FUW, ours, ours+EOPD, permutation x SEEDS="0 1 2"
+bash scripts/run_all_experiments_master.sh table2   # ablation (a) at_only, (b) length_norm, (c) kl
+bash scripts/run_all_experiments_master.sh eval     # student gốc + mọi run; so sánh: eval/compare_results.py
+```
+Mọi script train dùng chung `scripts/common.sh` (siêu tham số, đường dẫn, logger, checkpoint). Ghi đè bằng biến môi trường
+(`SEED`, `N_GPUS`, `TOTAL_EPOCHS`, `CW_MAX_STEPS`, ...) hoặc thêm override Hydra sau script. `DRY_RUN=1` chỉ in lệnh.
+
+### Log huấn luyện
+* Console + W&B + file: `logs/metrics/<project>/<exp>.jsonl` (mọi metric theo step), `logs/<exp>/train_*.log`, `logs/<exp>/command.txt` (lệnh + git hash).
+* Metric `cw/*` mỗi step: phân phối `g_k` (mean/p50/p90/p99/max, tỉ lệ bước >0.1, >0.3), vị trí tương đối của bước có shift lớn nhất,
+  trọng số (`w_max`, `w_std`, `w_top10pct_token_share`, `w_max_single_step_share`), `K`, độ dài bước, số ứng viên, `aT_cache_miss_frac`,
+  niềm tin `q0_aT/qK_aT/q0_bot/qK_bot`, `q_overflow_boundaries`, tỉ lệ ứng viên bị retokenize, sinh viên có đồng ý `aT` không,
+  và chi phí probe (`probe_sequences`, `probe_tokens`, `probe_tokens_per_response_token`, `probe_time_s`, giá trị tích lũy).
+* Trace từng rollout (belief q_0..q_K, g_k, trọng số mỗi bước, gold chỉ để phân tích) ở `<ckpt/log>/cw_opd/probe_stepNNNNNN.jsonl` mỗi `CW_DUMP_EVERY` step.
+* Validation MATH500 mỗi `TEST_FREQ` step, checkpoint (kèm `hf_model`) mỗi `SAVE_FREQ` step.
+
+### Giới hạn đã biết
+* Probe hiện chạy mỗi (ranh giới, ứng viên) như một chuỗi độc lập (chưa chia sẻ KV / tree attention) nên đắt: dùng `CW_MAX_STEPS` để giới hạn K;
+  overhead thực tế phải đo trong run thật (`cw/probe_time_s` so với thời gian step).
+* Đường GPU chưa được chạy thử trong môi trường phát triển; chỉ có unit test CPU với teacher giả (`tests/test_cw_opd.py`).

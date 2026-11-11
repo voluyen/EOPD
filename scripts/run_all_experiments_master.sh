@@ -8,13 +8,11 @@
 set -euo pipefail
 
 # Default environment configuration
-export STUDENT_MODEL=${STUDENT_MODEL:-"Qwen/Qwen3-1.7B-Base"}
-export TEACHER_MODEL=${TEACHER_MODEL:-"Qwen/Qwen3-8B"}
-export N_GPUS=${N_GPUS:-4}
-export NNODES=${NNODES:-1}
-export DATA_DIR=${DATA_DIR:-"data/math"}
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+source scripts/common.sh          # STUDENT_MODEL, TEACHER_MODEL, N_GPUS, DATA_DIR, TEACHER_CACHE, ...
+export STUDENT_MODEL TEACHER_MODEL N_GPUS NNODES DATA_DIR TEACHER_CACHE
 export BENCHMARKS_DIR=${BENCHMARKS_DIR:-"data/eval_benchmarks"}
-export TEACHER_CACHE=${TEACHER_CACHE:-"data/math/teacher_answers_qwen3_8b.json"}
+SEEDS=${SEEDS:-"0 1 2"}          # Section 6: 3 seeds
 
 print_banner() {
     gpu_count=$(nvidia-smi -L 2>/dev/null | grep -c "^GPU" || true)
@@ -73,6 +71,14 @@ cmd_prepare_data() {
     echo "Data preparation complete!"
 }
 
+cmd_setup() {
+    echo ""; echo ">>> [Step -2] Server setup"; bash scripts/setup_server.sh
+}
+
+cmd_models() {
+    echo ""; echo ">>> [Step -1] Downloading models"; bash scripts/download_models.sh
+}
+
 cmd_cache_teacher() {
     echo ""
     echo ">>> [Step 2] Caching Teacher Answers a_T..."
@@ -83,55 +89,48 @@ cmd_phase0() {
     echo ""
     echo ">>> [Step 3] Running Phase 0 Pilot (Pilot Without Training)..."
     bash scripts/run_phase0_pilot.sh
+    echo "Read experiments/phase0_pilot/phase0_report.md and decide GO/NO-GO before running table1/table2."
+}
+
+run_for_seeds() {   # <script> : run a training script for every seed
+    for seed in ${SEEDS}; do
+        echo "--- $1  seed=${seed}"
+        SEED="${seed}" bash "$1"
+    done
 }
 
 cmd_table1() {
     echo ""
-    echo ">>> [Step 4] Running Table 1 Main Comparison Experiments..."
-    echo "1/6: Running OPD baseline..."
-    bash scripts/run_train_t1_opd.sh
-
-    echo "2/6: Running EOPD baseline..."
-    bash scripts/run_train_t1_eopd.sh
-
-    echo "3/6: Running FUW baseline..."
-    bash scripts/run_train_t1_fuw.sh
-
-    echo "4/6: Running Ours (CW-OPD)..."
-    bash scripts/run_train_t1_ours_cw_opd.sh
-
-    echo "5/6: Running Ours + EOPD (CW-EOPD)..."
-    bash scripts/run_train_t1_ours_cw_eopd.sh
-
-    echo "6/6: Running Permutation Control..."
-    bash scripts/run_train_t1_permutation.sh
-    echo "Table 1 experiments complete!"
+    echo ">>> [Step 4] Table 1 (OPD, EOPD, FUW, ours, ours+EOPD, permutation control) x seeds: ${SEEDS}"
+    for s in run_train_t1_opd run_train_t1_eopd run_train_t1_fuw run_train_t1_ours_cw_opd \
+             run_train_t1_ours_cw_eopd run_train_t1_permutation; do
+        run_for_seeds "scripts/${s}.sh"
+    done
 }
 
 cmd_table2() {
     echo ""
-    echo ">>> [Step 5] Running Table 2 Ablation Experiments..."
-    echo "1/3: Running Ablation T2(a) - {a_T} Only..."
-    bash scripts/run_train_t2_ablation_at_only.sh
-
-    echo "2/3: Running Ablation T2(b) - Length Normalized Allocation..."
-    bash scripts/run_train_t2_ablation_length_norm.sh
-
-    echo "3/3: Running Ablation T2(c) - KL Information Gain..."
-    bash scripts/run_train_t2_ablation_kl.sh
-    echo "Table 2 ablations complete!"
+    echo ">>> [Step 5] Table 2 ablations x seeds: ${SEEDS}"
+    for s in run_train_t2_ablation_at_only run_train_t2_ablation_length_norm run_train_t2_ablation_kl; do
+        run_for_seeds "scripts/${s}.sh"
+    done
 }
 
 cmd_eval() {
     echo ""
-    echo ">>> [Step 6] Running Benchmark Evaluations..."
-    for exp_dir in checkpoints/*; do
-        if [ -d "${exp_dir}" ]; then
-            echo "Evaluating checkpoint in ${exp_dir}..."
-            bash scripts/run_eval_all_benchmarks.sh "${exp_dir}" || echo "Warning: eval failed on ${exp_dir}"
-        fi
+    echo ">>> [Step 6] Benchmark evaluation (untrained student + every finished run)"
+    if [ ! -f "${OUTPUT_ROOT}/student_base_eval.json" ]; then
+        OUTPUT_PATH="${OUTPUT_ROOT}/student_base_eval.json" bash scripts/run_eval_all_benchmarks.sh "${STUDENT_MODEL}" \
+            || echo "Warning: eval failed for the base student"
+    fi
+    for run_dir in "${OUTPUT_ROOT}"/t[12]_*_seed*; do
+        [ -f "${run_dir}/latest_checkpointed_iteration.txt" ] || continue
+        [ -f "${run_dir}/eval_results.json" ] && { echo "skip ${run_dir} (already evaluated)"; continue; }
+        bash scripts/run_eval_all_benchmarks.sh "${run_dir}" || echo "Warning: eval failed on ${run_dir}"
     done
-    echo "All evaluations complete!"
+    echo "Paired bootstrap, e.g.:"
+    echo "  python eval/compare_results.py --baseline ${OUTPUT_ROOT}/t1_eopd_seed{0,1,2}/eval_results.json \\"
+    echo "         --method ${OUTPUT_ROOT}/t1_ours_cw_eopd_seed{0,1,2}/eval_results.json"
 }
 
 print_banner
@@ -139,6 +138,12 @@ print_banner
 STEP=${1:-"all"}
 
 case "${STEP}" in
+    setup)
+        cmd_setup
+        ;;
+    models)
+        cmd_models
+        ;;
     check)
         cmd_env_check
         ;;
@@ -162,6 +167,7 @@ case "${STEP}" in
         ;;
     all)
         echo "Running complete end-to-end pipeline..."
+        cmd_models
         cmd_env_check
         cmd_prepare_data
         cmd_cache_teacher
@@ -169,12 +175,12 @@ case "${STEP}" in
         cmd_table1
         cmd_table2
         cmd_eval
-        echo "\n======================================================================"
+        printf "\n======================================================================\n"
         echo "  ALL EXPERIMENTS FINISHED SUCCESSFULLY!"
         echo "======================================================================"
         ;;
     *)
-        echo "Usage: bash scripts/run_all_experiments_master.sh [check|data|cache|phase0|table1|table2|eval|all]"
+        echo "Usage: bash scripts/run_all_experiments_master.sh [setup|models|check|data|cache|phase0|table1|table2|eval|all]"
         exit 1
         ;;
 esac

@@ -143,8 +143,34 @@ def are_answers_equivalent(ans1: str, ans2: str) -> bool:
 
 
 def get_prompt_hash(prompt_text: str) -> str:
-    """Create a deterministic hash identifier for a prompt text."""
-    return hashlib.sha256(prompt_text.strip().encode("utf-8")).hexdigest()[:16]
+    """Deterministic id of a question (whitespace-normalised), shared by the a_T cache and the trainer."""
+    norm = " ".join(prompt_text.split())
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+
+
+_USER_TURN_RE = re.compile(r"<\|im_start\|>user\n(.*?)<\|im_end\|>", re.DOTALL)
+
+
+def extract_question_from_chat_prompt(prompt_text: str) -> str:
+    """Recover the raw question from a chat-templated prompt (Qwen ChatML); returns the text itself otherwise.
+
+    The a_T cache is keyed by the dataset's raw question, whereas the trainer only sees the templated
+    prompt, so both sides must reduce to the same string before hashing.
+    """
+    turns = _USER_TURN_RE.findall(prompt_text)
+    return turns[-1].strip() if turns else prompt_text.strip()
+
+
+def question_text_from_messages(messages) -> str:
+    """Raw question from a dataset ``prompt`` field (list of chat messages or a plain string)."""
+    if isinstance(messages, str):
+        return messages
+    try:
+        users = [m for m in messages if isinstance(m, dict) and m.get("role") == "user"]
+        chosen = users[-1] if users else messages[-1]
+        return str(chosen.get("content", ""))
+    except Exception:
+        return str(messages)
 
 
 class CandidateManager:
@@ -187,7 +213,8 @@ class CandidateManager:
 
     def get_teacher_answer(self, prompt_id: str) -> Optional[str]:
         """Retrieve teacher answer a_T for prompt."""
-        return self.teacher_cache.get(prompt_id, None)
+        ans = self.teacher_cache.get(prompt_id, None)
+        return None if ans in (None, "", "None") else ans
 
     def get_candidate_set(self, prompt_id: str, at_only: bool = False) -> List[str]:
         """Construct candidate set C_x = {a_T} U H_x fixed before rollout.
@@ -202,8 +229,8 @@ class CandidateManager:
         """
         a_T = self.get_teacher_answer(prompt_id)
         candidates: List[str] = []
-        
-        if a_T:
+
+        if a_T and a_T != "None":
             candidates.append(a_T)
         else:
             # If teacher answer not cached, use a placeholder or empty
@@ -229,31 +256,33 @@ class CandidateManager:
         return candidates
 
     def update_history(self, prompt_id: str, student_rollout_response: str) -> Optional[str]:
-        """Extract final answer from completed rollout and add to history H_x for NEXT epochs.
-        
-        Args:
-            prompt_id: Identifier of the prompt.
-            student_rollout_response: Full text of the student's completed response.
-            
-        Returns:
-            The extracted canonical answer if valid, else None.
-        """
+        """Extract the final answer of a completed rollout and add it to H_x (used from the NEXT epoch on)."""
         boxed = extract_boxed_content(student_rollout_response)
         if not boxed:
             return None
+        return self.update_history_answer(prompt_id, canonicalize_answer(boxed))
 
-        clean_ans = canonicalize_answer(boxed)
+    def update_history_answer(self, prompt_id: str, clean_ans: str) -> Optional[str]:
+        """Add an already extracted+canonicalised answer to H_x (deduplicated, balanced braces only)."""
         if not clean_ans or not check_balanced_braces(clean_ans):
             return None
-
-        if prompt_id not in self.history:
-            self.history[prompt_id] = []
-
-        # Avoid duplicates in history
-        for existing in self.history[prompt_id]:
+        hist = self.history.setdefault(prompt_id, [])
+        for existing in hist:
             if are_answers_equivalent(clean_ans, existing):
                 return clean_ans
-
-        # Append to history
-        self.history[prompt_id].append(clean_ans)
+        hist.append(clean_ans)
         return clean_ans
+
+    def save_history(self, path: str):
+        """Persist H_x so a resumed run keeps its candidate sets."""
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.history, f, ensure_ascii=False)
+        os.replace(tmp, path)
+
+    def load_history(self, path: str):
+        if path and os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                self.history.update(json.load(f))
+            print(f"[CandidateManager] Restored H_x for {len(self.history)} prompts from {path}")

@@ -211,6 +211,29 @@ def permute_shifts_stratified(
     return permuted
 
 
+def shifts_from_beliefs(
+    beliefs: List[Dict[str, float]],
+    steps: List[StepBoundary],
+    ablation_mode: str = "none",
+    seed: Optional[int] = None,
+) -> List[float]:
+    """g_k = TV(q_k, q_{k-1}) for k = 1..K from beliefs q_0..q_K, with the T1/T2 variants applied."""
+    K = len(steps)
+    assert len(beliefs) == K + 1, f"need K+1={K + 1} beliefs, got {len(beliefs)}"
+    shifts: List[float] = []
+    for k in range(1, K + 1):
+        if ablation_mode == "kl_variant":
+            g = compute_kl_divergence(beliefs[k], beliefs[k - 1])
+        else:
+            g = compute_total_variation(beliefs[k], beliefs[k - 1])
+        if ablation_mode == "length_norm":
+            g = g / max(1, steps[k - 1].token_len)
+        shifts.append(g)
+    if ablation_mode == "permutation":
+        shifts = permute_shifts_stratified(shifts, steps, seed=seed)
+    return shifts
+
+
 class ProbeScorer:
     """Computes probed answer beliefs q_k and shifts g_k using the teacher model."""
 
@@ -229,8 +252,12 @@ class ProbeScorer:
         prefix_texts: List[str],
         candidate_answers: List[str],
         device: torch.device = torch.device("cpu"),
+        allow_mock: bool = False,
     ) -> List[Dict[str, float]]:
-        """Score candidate answers following probe prefix given a teacher model.
+        """Score candidate answers following probe prefix given a teacher model (text-based, HF model).
+
+        NOTE: training uses the token-exact path in ``teacher_probe.py``; this text-based scorer is kept
+        for small HF-model use. ``teacher_model=None`` is only allowed with ``allow_mock=True`` (unit tests).
         
         For each prefix:
             appends probe string π
@@ -245,6 +272,11 @@ class ProbeScorer:
 
         # If model is None (e.g. testing or mock), generate dummy uniform/mock distribution
         if teacher_model is None:
+            if not allow_mock:
+                raise ValueError(
+                    "teacher_model is None: refusing to return a dummy belief (it would silently give g_k = 0). "
+                    "Pass allow_mock=True only in unit tests."
+                )
             for _ in prefix_texts:
                 dist = {}
                 n = len(candidate_answers)
@@ -293,14 +325,8 @@ class ProbeScorer:
                 cand_probs[cand] = prob
                 total_cand_prob += prob
 
-            # Residual cell q(bot)
-            if total_cand_prob > 1.0:
-                # Normalize candidates if numerical overflow > 1.0
-                for c in cand_probs:
-                    cand_probs[c] /= total_cand_prob
-                cand_probs["bot"] = 0.0
-            else:
-                cand_probs["bot"] = max(0.0, 1.0 - total_cand_prob)
+            # Residual cell q(bot) = max(0, 1 - sum_a q(a)); candidates are NOT renormalized
+            cand_probs["bot"] = max(0.0, 1.0 - total_cand_prob)
 
             results.append(cand_probs)
 
@@ -316,6 +342,7 @@ class ProbeScorer:
         response_tokens: Optional[List[int]] = None,
         device: torch.device = torch.device("cpu"),
         seed: Optional[int] = None,
+        allow_mock: bool = False,
     ) -> Tuple[List[StepBoundary], List[float], List[Dict[str, float]]]:
         """Compute reasoning step shifts g_k for a single student rollout.
         
@@ -362,29 +389,10 @@ class ProbeScorer:
             prefix_texts=prefixes,
             candidate_answers=cands,
             device=device,
+            allow_mock=allow_mock,
         )
 
-        # Compute shifts g_k between q_k and q_{k-1} for k = 1 .. K
-        shifts: List[float] = []
-        for k in range(1, K + 1):
-            q_curr = beliefs[k]
-            q_prev = beliefs[k - 1]
-
-            if self.ablation_mode == "kl_variant":
-                g = compute_kl_divergence(q_curr, q_prev)
-            else:
-                # Default Total Variation
-                g = compute_total_variation(q_curr, q_prev)
-
-            if self.ablation_mode == "length_norm":
-                L_k = max(1, steps[k - 1].token_len)
-                g = g / L_k
-
-            shifts.append(g)
-
-        # Permutation control: shuffle shifts within strata
-        if self.ablation_mode == "permutation":
-            shifts = permute_shifts_stratified(shifts, steps, seed=seed)
+        shifts = shifts_from_beliefs(beliefs, steps, self.ablation_mode, seed=seed)
 
         return steps, shifts, beliefs
 
