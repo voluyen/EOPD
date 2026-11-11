@@ -123,6 +123,8 @@ ENV/
 # data
 *.parquet
 
+# pdf
+*.pdf
 
 # local logs
 logs
