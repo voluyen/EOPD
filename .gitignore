@@ -126,6 +126,10 @@ ENV/
 # pdf
 *.pdf
 
+# proposal
+proposal*
+*.tex
+
 # local logs
 logs
 log
